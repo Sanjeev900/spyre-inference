@@ -276,10 +276,6 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         self._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # RoBERTa/XLM-RoBERTa checkpoints save position_ids as a persistent buffer;
-        # vLLM's loader rejects it because the module registers it as non-persistent.
-        # Safe to ignore for all models — no decoder checkpoint uses this key.
-        self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug("SpyreTransformersForCausalLM ready: %s", type(self.model).__name__)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
