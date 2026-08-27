@@ -45,10 +45,18 @@ def register_ops():
 
     register_all()
 
-    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
+    # So that ``model_impl="transformers"`` picks up the Spyre adaptations.
     ModelRegistry.register_model(
         "TransformersForCausalLM",
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "TransformersEmbeddingModel",
+        "spyre_inference.transformers_backend:SpyreTransformersEmbeddingModel",
+    )
+    ModelRegistry.register_model(
+        "TransformersForSequenceClassification",
+        "spyre_inference.transformers_backend:SpyreTransformersForSequenceClassification",
     )
 
 

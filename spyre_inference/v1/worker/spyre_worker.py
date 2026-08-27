@@ -35,7 +35,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
-from spyre_inference.custom_ops import register_all
+from spyre_inference import register_ops
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -125,10 +125,10 @@ class TorchSpyreWorker(Worker):
             _get_spyre_pcie_address(self.local_rank),
         )
 
-        # Register all the custom ops here when a worker is created.
-        # This has to happen before the model is loaded, so that all the
-        # layers will be swapped out with the custom implementations for spyre.
-        register_all()
+        # Register custom ops and model registry overrides before the model
+        # is loaded, so layers are swapped out and Transformers backend
+        # adapters are in place.
+        register_ops()
 
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
