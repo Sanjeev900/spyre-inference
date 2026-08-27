@@ -240,6 +240,73 @@ def test_patched_apply_rotary_leaves_stock_hf_callers_working():
         modeling_llama.apply_rotary_pos_emb = original
 
 
+# ---------------------------------------------------------------------------
+# Encoder pooling / reranker models with model_impl='transformers'
+# ---------------------------------------------------------------------------
+
+ENCODER_EMBED_MODELS = [
+    "intfloat/multilingual-e5-large",
+    "sentence-transformers/all-roberta-large-v1",
+]
+
+ENCODER_RERANKER_MODELS = [
+    "BAAI/bge-reranker-v2-m3",
+]
+
+_EMBED_PROMPT = "Hello, Spyre!"
+_RERANKER_PAIR = ("What is Spyre?", "An IBM AI accelerator.")
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", ENCODER_EMBED_MODELS)
+def test_transformers_encoder_embed(model: str) -> None:
+    """Encoder pooling models load and embed via model_impl='transformers'."""
+    import math
+
+    from vllm import LLM
+
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=1,
+        enforce_eager=True,
+        model_impl="transformers",
+    )
+    assert llm.llm_engine.model_config.using_transformers_backend()
+    outputs = llm.embed([_EMBED_PROMPT])
+    assert len(outputs) == 1
+    emb = outputs[0].outputs.embedding
+    assert len(emb) > 0
+    assert all(math.isfinite(x) for x in emb)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", ENCODER_RERANKER_MODELS)
+def test_transformers_encoder_rerank(model: str) -> None:
+    """Reranker models load and score via model_impl='transformers'."""
+    import math
+
+    from vllm import LLM
+
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=1,
+        enforce_eager=True,
+        model_impl="transformers",
+    )
+    assert llm.llm_engine.model_config.using_transformers_backend()
+    scores = llm.score(*_RERANKER_PAIR)
+    assert len(scores) == 1
+    assert math.isfinite(scores[0].outputs.score)
+
+
+# ---------------------------------------------------------------------------
+# Decoder causal LM
+# ---------------------------------------------------------------------------
+
 PROMPTS = [
     "Hello, my name is",
     "The capital of France is",
