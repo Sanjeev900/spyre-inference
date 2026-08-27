@@ -180,15 +180,20 @@ def _rope_dispatch(original: Callable) -> Callable:
 
 
 def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-    """Replace ``torch.gather`` in ``XLMRobertaEmbeddings.forward`` with ``index_select``.
+    """Swap ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path.
 
-    HF's ``XLMRobertaEmbeddings`` expands a ``[1, max_pos]`` buffer via
-    ``torch.gather(buf, dim=1, index=position_ids)`` to produce ``[batch, seq_len]``
-    token type ids.  ``aten::gather`` is not implemented on Spyre; ``index_select``
-    is, and produces identical output for this specific 2-D single-row case.
+    HF's forward has two branches for ``token_type_ids``:
+    * buffer present  → ``torch.gather`` (aten::gather, not on Spyre)
+    * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (int64→int32 downcast,
+                         hits torch-spyre stick-incompatibility in the embedding lookup)
 
-    The replacement is bound as an instance method so it only affects Spyre-loaded
-    models and leaves any other HF model in the process untouched.
+    Neither branch works on Spyre.  The subclass overrides ``forward`` to short-circuit
+    both: it passes an explicit ``token_type_ids`` of zeros with the model's own dtype
+    so the embedding lookup receives a correctly-typed tensor.
+
+    ``module.__class__`` is rewritten in-place so all existing state is preserved and
+    Dynamo sees a proper bound method (avoids ``TypeError: missing required positional
+    argument: self`` when tracing an instance-level forward replacement).
     """
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
@@ -197,39 +202,57 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     except ImportError:
         return
 
+    class _XLMRobertaEmbeddingsSpyre(XLMRobertaEmbeddings):
+        def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
+                    inputs_embeds=None, past_key_values_length=0):
+            if token_type_ids is None:
+                # Both HF branches are broken on Spyre:
+                #   buffer present → torch.gather (aten::gather not on Spyre)
+                #   buffer absent  → torch.zeros(dtype=torch.long) → int32 downcast
+                #                    → stick-incompatibility in embedding lookup
+                # XLM-RoBERTa only has one token type, so all IDs are 0 and
+                # token_type_embeddings always returns weight[0] broadcast.
+                # Compute it directly to avoid any integer tensor on Spyre.
+                if input_ids is not None:
+                    shape = (*input_ids.shape, self.token_type_embeddings.embedding_dim)
+                    dev = input_ids.device
+                else:
+                    shape = inputs_embeds.shape
+                    dev = inputs_embeds.device
+                dtype = self.word_embeddings.weight.dtype
+                token_type_embeddings = self.token_type_embeddings.weight[0].to(dev, dtype).expand(shape)
+                # Now run the rest of forward manually, bypassing the embedding call.
+                if position_ids is None:
+                    if input_ids is not None:
+                        position_ids = self.create_position_ids_from_input_ids(
+                            input_ids, self.padding_idx, past_key_values_length
+                        )
+                    else:
+                        position_ids = self.create_position_ids_from_inputs_embeds(
+                            inputs_embeds, self.padding_idx
+                        )
+                if inputs_embeds is None:
+                    inputs_embeds = self.word_embeddings(input_ids)
+                embeddings = inputs_embeds + token_type_embeddings
+                embeddings = embeddings + self.position_embeddings(position_ids)
+                embeddings = self.LayerNorm(embeddings)
+                return self.dropout(embeddings)
+            return super().forward(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                past_key_values_length=past_key_values_length,
+            )
+
     for _, module in model.named_modules():
         if not isinstance(module, XLMRobertaEmbeddings):
             continue
-        if not hasattr(module, "token_type_ids"):
-            continue
-        if getattr(module, "_spyre_patched", False):
-            continue
+        if type(module) is _XLMRobertaEmbeddingsSpyre:
+            continue  # already patched
 
-        original_forward = module.__class__.forward
-
-        def _make_forward(orig):
-            def forward(self, *args, **kwargs):
-                # Temporarily swap gather → index_select for the duration of this call.
-                import torch as _torch
-                original_gather = _torch.gather
-
-                def _gather_via_index_select(input, dim, index, *a, **kw):
-                    # Only intercept the 2-D single-row token_type_ids gather.
-                    if input.dim() == 2 and dim == 1 and input.shape[0] == 1:
-                        return input.index_select(1, index.flatten()).view(index.shape)
-                    return original_gather(input, dim, index, *a, **kw)
-
-                _torch.gather = _gather_via_index_select
-                try:
-                    return orig(self, *args, **kwargs)
-                finally:
-                    _torch.gather = original_gather
-
-            return forward
-
-        module.forward = _make_forward(original_forward)
-        module._spyre_patched = True
-        logger.debug("Patched XLMRobertaEmbeddings.forward: gather → index_select")
+        module.__class__ = _XLMRobertaEmbeddingsSpyre
+        logger.debug("Replaced XLMRobertaEmbeddings with gather-free subclass")
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
