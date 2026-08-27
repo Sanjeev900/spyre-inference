@@ -180,16 +180,15 @@ def _rope_dispatch(original: Callable) -> Callable:
 
 
 def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-    """Remove the ``token_type_ids`` buffer from ``XLMRobertaEmbeddings`` instances.
+    """Replace ``torch.gather`` in ``XLMRobertaEmbeddings.forward`` with ``index_select``.
 
-    HF's ``XLMRobertaEmbeddings`` registers a ``[1, max_pos]`` all-zero buffer and,
-    when present, expands it to ``[batch, seq_len]`` via ``torch.gather``.
-    ``aten::gather`` is not implemented on the Spyre backend.  Deleting the buffer
-    makes HF take its else-branch, which produces the same all-zero result via
-    ``torch.zeros(..., device=inputs_embeds.device)`` — no gather needed.
+    HF's ``XLMRobertaEmbeddings`` expands a ``[1, max_pos]`` buffer via
+    ``torch.gather(buf, dim=1, index=position_ids)`` to produce ``[batch, seq_len]``
+    token type ids.  ``aten::gather`` is not implemented on Spyre; ``index_select``
+    is, and produces identical output for this specific 2-D single-row case.
 
-    Guarded by an ImportError so this is a no-op if XLM-RoBERTa is not installed,
-    and by a ``hasattr`` check so it is safe to call on any model.
+    The replacement is bound as an instance method so it only affects Spyre-loaded
+    models and leaves any other HF model in the process untouched.
     """
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
@@ -199,9 +198,38 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
         return
 
     for _, module in model.named_modules():
-        if isinstance(module, XLMRobertaEmbeddings) and hasattr(module, "token_type_ids"):
-            del module.token_type_ids
-            logger.debug("Removed XLMRobertaEmbeddings.token_type_ids buffer to avoid aten::gather")
+        if not isinstance(module, XLMRobertaEmbeddings):
+            continue
+        if not hasattr(module, "token_type_ids"):
+            continue
+        if getattr(module, "_spyre_patched", False):
+            continue
+
+        original_forward = module.__class__.forward
+
+        def _make_forward(orig):
+            def forward(self, *args, **kwargs):
+                # Temporarily swap gather → index_select for the duration of this call.
+                import torch as _torch
+                original_gather = _torch.gather
+
+                def _gather_via_index_select(input, dim, index, *a, **kw):
+                    # Only intercept the 2-D single-row token_type_ids gather.
+                    if input.dim() == 2 and dim == 1 and input.shape[0] == 1:
+                        return input.index_select(1, index.flatten()).view(index.shape)
+                    return original_gather(input, dim, index, *a, **kw)
+
+                _torch.gather = _gather_via_index_select
+                try:
+                    return orig(self, *args, **kwargs)
+                finally:
+                    _torch.gather = original_gather
+
+            return forward
+
+        module.forward = _make_forward(original_forward)
+        module._spyre_patched = True
+        logger.debug("Patched XLMRobertaEmbeddings.forward: gather → index_select")
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
