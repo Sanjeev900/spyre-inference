@@ -399,6 +399,10 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # RoBERTa/XLM-RoBERTa checkpoints save position_ids as a persistent buffer;
+        # vLLM's loader rejects it as unexpected because the module registers it as
+        # non-persistent. Safe to ignore — it is recreated at runtime.
+        self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug("SpyreTransformersEmbeddingModel ready: %s", type(self.model).__name__)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -478,6 +482,7 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
