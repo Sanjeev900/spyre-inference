@@ -503,8 +503,8 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: list[torch.Tensor],
-        attn_metadata: Any,
+        kv_caches: list[torch.Tensor] | None = None,
+        attn_metadata: Any = None,
         **kwargs,
     ) -> torch.Tensor:
         import torch.nn.functional as F
