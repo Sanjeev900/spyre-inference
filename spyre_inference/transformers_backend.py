@@ -270,37 +270,43 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
 
 
 def _patch_distilbert_embeddings(model: nn.Module) -> None:
-    """Patch DistilBertEmbeddings to slice position_ids to the actual sequence length if they mismatch.
+    """Patch DistilBert Embeddings to avoid PyTorch Dynamo slicing bug on position_ids buffer.
 
-    During whole-model compilation/warmup, a fake tensor broadcasting mismatch is triggered
-    because position_ids (e.g., 512) doesn't match the inputs sequence length (e.g., 16).
-    Slicing position_ids to the actual sequence length solves this cleanly.
+    During whole-model compilation/warmup, a fake tensor broadcasting mismatch is triggered:
+    mismatching shape [1, 512, 768] vs [1, 16, 768].
+    This occurs because PyTorch Dynamo/FakeTensor traces the slice `self.position_ids[:, :seq_length]`
+    with the static buffer's full length (512) rather than the dynamic sequence length (seq_length).
+    Overriding the embeddings class to generate position_ids dynamically avoids this slicing bug.
     """
     try:
-        from transformers.models.distilbert.modeling_distilbert import DistilBertEmbeddings
+        from transformers.models.distilbert.modeling_distilbert import Embeddings
     except ImportError:
         return
 
-    class _DistilBertEmbeddingsSpyre(DistilBertEmbeddings):
-        def forward(self, input_ids=None, inputs_embeds=None, position_ids=None):
+    class _DistilBertEmbeddingsSpyre(Embeddings):
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            inputs_embeds: torch.Tensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+        ) -> torch.Tensor:
             if input_ids is not None:
-                seq_length = input_ids.shape[1] if input_ids.ndim > 1 else input_ids.shape[0]
-            elif inputs_embeds is not None:
-                seq_length = inputs_embeds.shape[1]
-            else:
-                seq_length = 0
+                inputs_embeds = self.word_embeddings(input_ids)
 
-            if position_ids is not None and seq_length > 0 and position_ids.shape[-1] != seq_length:
-                position_ids = position_ids[..., :seq_length]
+            seq_length = inputs_embeds.size(1)
 
-            return super().forward(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                position_ids=position_ids,
-            )
+            # Generate position_ids dynamically to bypass the PyTorch Dynamo slicing bug on static buffers
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device)
+            position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.shape[0], seq_length)
+
+            position_embeddings = self.position_embeddings(position_ids)
+
+            embeddings = inputs_embeds + position_embeddings
+            embeddings = self.LayerNorm(embeddings)
+            return self.dropout(embeddings)
 
     for _, module in model.named_modules():
-        if isinstance(module, DistilBertEmbeddings):
+        if isinstance(module, Embeddings):
             if type(module) is _DistilBertEmbeddingsSpyre:
                 continue
             module.__class__ = _DistilBertEmbeddingsSpyre
