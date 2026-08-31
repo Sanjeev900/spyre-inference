@@ -29,7 +29,7 @@ from __future__ import annotations
 import functools
 import sys
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -180,14 +180,14 @@ def _rope_dispatch(original: Callable) -> Callable:
 
 
 def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-    """Swap ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path on token segment IDs.
+    """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path on token segment IDs.
 
     HF's standard forward has two branches for ``token_type_ids``:
     * buffer present  → ``torch.gather`` (aten::gather, not supported on Spyre layout remapper)
     * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32 downcast and
                          subsequent layout/ReStickifyOpHBM compile crash on Spyre)
 
-    Neither branch compiles on Spyre. Since XLM-RoBERTa only has one token type, all IDs are 0
+    Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token type, all IDs are 0
     and token_type_embeddings always returns weight[0] broadcasted.
     The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
     integer indexing lookup entirely, ensuring only float16/float32 operations exist.
@@ -196,13 +196,22 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     Dynamo traces the clean, tensor-only replacement forward method seamlessly.
     """
     try:
+        from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
+    except ImportError:
+        RobertaEmbeddings = None
+
+    try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings,
         )
     except ImportError:
+        XLMRobertaEmbeddings = None
+
+    base_class = RobertaEmbeddings or XLMRobertaEmbeddings
+    if base_class is None:
         return
 
-    class _XLMRobertaEmbeddingsSpyre(XLMRobertaEmbeddings):
+    class _RobertaEmbeddingsSpyre(base_class):
         def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
                     inputs_embeds=None, past_key_values_length=0):
             if token_type_ids is None:
@@ -248,14 +257,16 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
                 past_key_values_length=past_key_values_length,
             )
 
+    target_classes = tuple(c for c in (RobertaEmbeddings, XLMRobertaEmbeddings) if c is not None)
+
     for _, module in model.named_modules():
-        if not isinstance(module, XLMRobertaEmbeddings):
+        if not isinstance(module, target_classes):
             continue
-        if type(module) is _XLMRobertaEmbeddingsSpyre:
+        if type(module) is _RobertaEmbeddingsSpyre:
             continue  # already patched
 
-        module.__class__ = _XLMRobertaEmbeddingsSpyre
-        logger.debug("Replaced XLMRobertaEmbeddings with gather-free subclass")
+        module.__class__ = _RobertaEmbeddingsSpyre
+        logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
@@ -483,18 +494,45 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.ignore_unexpected_suffixes.append("position_ids")
 
-        # Clean Fix: Alias the pre_classifier if the underlying model has one
-        # to ensure vLLM's SequenceClassification weight loader finds it.
-        if hasattr(self.model, "pre_classifier") and not hasattr(self, "pre_classifier"):
-            self.pre_classifier = self.model.pre_classifier
-
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
         )
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: list[torch.Tensor],
+        attn_metadata: Any,
+        **kwargs,
+    ) -> torch.Tensor:
+        import torch.nn.functional as F
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, **kwargs)
+        pooled_states = self.pooler(hidden_states, attn_metadata)
+
+        if hasattr(self, "pre_classifier"):
+            pooled_states = self.pre_classifier(pooled_states)
+            pooled_states = F.relu(pooled_states)
+            pooled_states = self.dropout(pooled_states)
+
+        return self.classifier(pooled_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
+        # Convert weight generator to a list to inspect keys and reuse them.
+        # This makes the pre_classifier fix completely generic for any model
+        # architecture that carries pre_classifier parameters in its weights.
+        weights_list = list(weights)
+        if any("pre_classifier" in key for key, _ in weights_list) and not hasattr(self, "pre_classifier"):
+            config = self.model.config
+            hidden_size = getattr(config, "dim", getattr(config, "hidden_size", 768))
+            self.pre_classifier = nn.Linear(hidden_size, hidden_size)
+            self.dropout = nn.Dropout(
+                p=getattr(config, "seq_classif_dropout", getattr(config, "dropout", 0.2))
+            )
+            logger.info("Dynamically instantiated pre_classifier and dropout submodules based on checkpoint weights")
+
+        result = super().load_weights(weights_list)
         _patch_xlm_roberta_gather(self.model)
         self._patch_rope()
         return result
