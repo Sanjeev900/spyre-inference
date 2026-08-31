@@ -39,6 +39,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import (
     TransformersEmbeddingModel,
     TransformersForCausalLM,
+    TransformersForSequenceClassification,
 )
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
@@ -176,6 +177,85 @@ def _rope_dispatch(original: Callable) -> Callable:
 
     apply_rotary_pos_emb._spyre_patched = True
     return apply_rotary_pos_emb
+
+
+def _patch_xlm_roberta_gather(model: nn.Module) -> None:
+    """Swap ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path on token segment IDs.
+
+    HF's standard forward has two branches for ``token_type_ids``:
+    * buffer present  → ``torch.gather`` (aten::gather, not supported on Spyre layout remapper)
+    * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32 downcast and
+                         subsequent layout/ReStickifyOpHBM compile crash on Spyre)
+
+    Neither branch compiles on Spyre. Since XLM-RoBERTa only has one token type, all IDs are 0
+    and token_type_embeddings always returns weight[0] broadcasted.
+    The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
+    integer indexing lookup entirely, ensuring only float16/float32 operations exist.
+
+    ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
+    Dynamo traces the clean, tensor-only replacement forward method seamlessly.
+    """
+    try:
+        from transformers.models.xlm_roberta.modeling_xlm_roberta import (
+            XLMRobertaEmbeddings,
+        )
+    except ImportError:
+        return
+
+    class _XLMRobertaEmbeddingsSpyre(XLMRobertaEmbeddings):
+        def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
+                    inputs_embeds=None, past_key_values_length=0):
+            if token_type_ids is None:
+                # Retrieve the activation shape and device details from word embeddings
+                if input_ids is not None:
+                    batch_size, seq_length = input_ids.shape
+                    dev = input_ids.device
+                else:
+                    batch_size, seq_length = inputs_embeds.shape[:2]
+                    dev = inputs_embeds.device
+                
+                # Directly slice weight[0] and expand to match activation dimensions
+                # weight[0] is already in the module's correct device and float dtype
+                token_type_embeddings = (
+                    self.token_type_embeddings.weight[0]
+                    .view(1, 1, -1)
+                    .expand(batch_size, seq_length, -1)
+                )
+
+                # Recreate the rest of the forward pass manually, bypassing the lookup
+                if position_ids is None:
+                    if input_ids is not None:
+                        position_ids = self.create_position_ids_from_input_ids(
+                            input_ids, self.padding_idx, past_key_values_length
+                        )
+                    else:
+                        position_ids = self.create_position_ids_from_inputs_embeds(
+                            inputs_embeds, self.padding_idx
+                        )
+                if inputs_embeds is None:
+                    inputs_embeds = self.word_embeddings(input_ids)
+                
+                embeddings = inputs_embeds + token_type_embeddings
+                embeddings = embeddings + self.position_embeddings(position_ids)
+                embeddings = self.LayerNorm(embeddings)
+                return self.dropout(embeddings)
+            
+            return super().forward(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                past_key_values_length=past_key_values_length,
+            )
+
+    for _, module in model.named_modules():
+        if not isinstance(module, XLMRobertaEmbeddings):
+            continue
+        if type(module) is _XLMRobertaEmbeddingsSpyre:
+            continue  # already patched
+
+        module.__class__ = _XLMRobertaEmbeddingsSpyre
+        logger.debug("Replaced XLMRobertaEmbeddings with gather-free subclass")
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
@@ -330,6 +410,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         result = super().load_weights(weights)
+        _patch_xlm_roberta_gather(self.model)
         self._patch_rope()
         return result
 
@@ -391,3 +472,36 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
 
 # Same aliasing requirement as SpyreTransformersForCausalLM.
 SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
+
+
+class SpyreTransformersForSequenceClassification(TransformersForSequenceClassification):
+    """Transformers backend for pooling/classify (reranker) models on Spyre."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
+        self._max_position = vllm_config.model_config.max_model_len
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.ignore_unexpected_suffixes.append("position_ids")
+
+        # Clean Fix: Alias the pre_classifier if the underlying model has one
+        # to ensure vLLM's SequenceClassification weight loader finds it.
+        if hasattr(self.model, "pre_classifier") and not hasattr(self, "pre_classifier"):
+            self.pre_classifier = self.model.pre_classifier
+
+        logger.debug(
+            "SpyreTransformersForSequenceClassification ready: %s",
+            type(self.model).__name__,
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        _patch_xlm_roberta_gather(self.model)
+        self._patch_rope()
+        return result
+
+    def _patch_rope(self):
+        SpyreTransformersEmbeddingModel._patch_rope(self)
+
+
+# Same aliasing requirement as SpyreTransformersForCausalLM.
+SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"
