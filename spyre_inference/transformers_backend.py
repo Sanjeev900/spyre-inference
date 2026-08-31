@@ -36,7 +36,10 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -304,3 +307,87 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
 # against "TransformersForCausalLM", so the subclass has to keep answering to that name.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
+
+
+class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
+    """Transformers backend for pooling/embed models with the Spyre RoPE replacement.
+
+    Encoder models that use absolute position embeddings (BERT, RoBERTa, XLM-RoBERTa)
+    have no ``rotary_emb`` on their backbone; ``_patch_rope`` is a no-op for them.
+    Models that do use RoPE (e.g. NomicBERT / Granite-125m) go through the same
+    matmul-based rotation as the decoder adapter.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
+        self._max_position = vllm_config.model_config.max_model_len
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # RoBERTa/XLM-RoBERTa checkpoints save position_ids as a persistent buffer;
+        # vLLM's loader rejects it as unexpected because the module registers it as
+        # non-persistent. Safe to ignore — it is recreated at runtime.
+        self.ignore_unexpected_suffixes.append("position_ids")
+        logger.debug("SpyreTransformersEmbeddingModel ready: %s", type(self.model).__name__)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        self._patch_rope()
+        return result
+
+    def _patch_rope(self):
+        """Swap HF's rotary embedding for the Spyre matmul-based one, if present.
+
+        Most encoder architectures (BERT, RoBERTa, XLM-RoBERTa) use absolute position
+        embeddings and have no ``rotary_emb`` on the model — for those this is a no-op.
+        NomicBERT / Granite-125m do use RoPE and go through the full patch path.
+        """
+        if not hasattr(self.model, "rotary_emb"):
+            return
+
+        cfg = getattr(self.model, "config", self.model.config)
+
+        rope_source = self.model.get_submodule("rotary_emb")
+        orig_head_dim = original_head_dim(cfg)
+        padded_head_dim = None
+        if orig_head_dim is not None:
+            padded_head_dim = cfg.head_dim
+            rope_source = _rope_at_original_head_dim(cfg, rope_source, orig_head_dim)
+
+        spyre_rope = _SpyreRotaryEmbedding(
+            rope_source,
+            self._max_position,
+            padded_head_dim,
+            next(self.model.parameters()).dtype,
+        )
+        self.model.rotary_emb = spyre_rope
+
+        patched_mods: set[int] = set()
+        for name, module in self.model.named_modules():
+            if module is spyre_rope:
+                continue
+
+            cls_name = module.__class__.__name__
+
+            if cls_name.endswith("RotaryEmbedding"):
+                parent_name, _, attr = name.rpartition(".")
+                parent = self.model.get_submodule(parent_name) if parent_name else self.model
+                setattr(parent, attr, spyre_rope)
+                continue
+
+            if "Attention" not in cls_name:
+                continue
+
+            if not hasattr(module, "rotary_emb"):
+                module.rotary_emb = spyre_rope
+
+            mod = sys.modules.get(type(module).__module__)
+            if mod is None or id(mod) in patched_mods:
+                continue
+            existing = getattr(mod, "apply_rotary_pos_emb", None)
+            if existing is None or getattr(existing, "_spyre_patched", False):
+                continue
+            mod.apply_rotary_pos_emb = _rope_dispatch(existing)
+            patched_mods.add(id(mod))
+
+
+# Same aliasing requirement as SpyreTransformersForCausalLM.
+SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
