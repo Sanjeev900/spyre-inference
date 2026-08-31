@@ -269,6 +269,44 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
         logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
 
 
+def _patch_distilbert_embeddings(model: nn.Module) -> None:
+    """Patch DistilBertEmbeddings to slice position_ids to the actual sequence length if they mismatch.
+
+    During whole-model compilation/warmup, a fake tensor broadcasting mismatch is triggered
+    because position_ids (e.g., 512) doesn't match the inputs sequence length (e.g., 16).
+    Slicing position_ids to the actual sequence length solves this cleanly.
+    """
+    try:
+        from transformers.models.distilbert.modeling_distilbert import DistilBertEmbeddings
+    except ImportError:
+        return
+
+    class _DistilBertEmbeddingsSpyre(DistilBertEmbeddings):
+        def forward(self, input_ids=None, inputs_embeds=None, position_ids=None):
+            if input_ids is not None:
+                seq_length = input_ids.shape[1] if input_ids.ndim > 1 else input_ids.shape[0]
+            elif inputs_embeds is not None:
+                seq_length = inputs_embeds.shape[1]
+            else:
+                seq_length = 0
+
+            if position_ids is not None and seq_length > 0 and position_ids.shape[-1] != seq_length:
+                position_ids = position_ids[..., :seq_length]
+
+            return super().forward(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+            )
+
+    for _, module in model.named_modules():
+        if isinstance(module, DistilBertEmbeddings):
+            if type(module) is _DistilBertEmbeddingsSpyre:
+                continue
+            module.__class__ = _DistilBertEmbeddingsSpyre
+            logger.debug("Replaced %s with Spyre-compatible slice-safe subclass", type(module).__name__)
+
+
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
     """Rebuild *rope* at the pre-pad head_dim.
 
@@ -422,6 +460,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         result = super().load_weights(weights)
         _patch_xlm_roberta_gather(self.model)
+        _patch_distilbert_embeddings(self.model)
         self._patch_rope()
         return result
 
@@ -534,6 +573,7 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
 
         result = super().load_weights(weights_list)
         _patch_xlm_roberta_gather(self.model)
+        _patch_distilbert_embeddings(self.model)
         self._patch_rope()
         return result
 
