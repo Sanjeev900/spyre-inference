@@ -217,10 +217,8 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
             if token_type_ids is None:
                 if input_ids is not None:
                     batch_size, seq_length = input_ids.shape
-                    dev = input_ids.device
                 else:
                     batch_size, seq_length = inputs_embeds.shape[:2]
-                    dev = inputs_embeds.device
                 token_type_embeddings = (
                     self.token_type_embeddings.weight[0]
                     .view(1, 1, -1)
