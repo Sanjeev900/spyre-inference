@@ -179,138 +179,117 @@ def _rope_dispatch(original: Callable) -> Callable:
     return apply_rotary_pos_emb
 
 
-def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-    """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path on token segment IDs.
-
-    HF's standard forward has two branches for ``token_type_ids``:
-    * buffer present  → ``torch.gather`` (aten::gather, not supported on Spyre layout remapper)
-    * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32 downcast and
-                         subsequent layout/ReStickifyOpHBM compile crash on Spyre)
-
-    Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token type, all IDs are 0
-    and token_type_embeddings always returns weight[0] broadcasted.
-    The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
-    integer indexing lookup entirely, ensuring only float16/float32 operations exist.
-
-    ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
-    Dynamo traces the clean, tensor-only replacement forward method seamlessly.
-    """
-    try:
-        from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
-    except ImportError:
-        RobertaEmbeddings = None
-
-    try:
-        from transformers.models.xlm_roberta.modeling_xlm_roberta import (
-            XLMRobertaEmbeddings,
-        )
-    except ImportError:
-        XLMRobertaEmbeddings = None
-
-    base_class = RobertaEmbeddings or XLMRobertaEmbeddings
-    if base_class is None:
-        return
-
-    class _RobertaEmbeddingsSpyre(base_class):
-        def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
-                    inputs_embeds=None, past_key_values_length=0):
-            if token_type_ids is None:
-                # Retrieve the activation shape and device details from word embeddings
-                if input_ids is not None:
-                    batch_size, seq_length = input_ids.shape
-                    dev = input_ids.device
-                else:
-                    batch_size, seq_length = inputs_embeds.shape[:2]
-                    dev = inputs_embeds.device
-                
-                # Directly slice weight[0] and expand to match activation dimensions
-                # weight[0] is already in the module's correct device and float dtype
-                token_type_embeddings = (
-                    self.token_type_embeddings.weight[0]
-                    .view(1, 1, -1)
-                    .expand(batch_size, seq_length, -1)
-                )
-
-                # Recreate the rest of the forward pass manually, bypassing the lookup
-                if position_ids is None:
-                    if input_ids is not None:
-                        position_ids = self.create_position_ids_from_input_ids(
-                            input_ids, self.padding_idx, past_key_values_length
-                        )
-                    else:
-                        position_ids = self.create_position_ids_from_inputs_embeds(
-                            inputs_embeds, self.padding_idx
-                        )
-                if inputs_embeds is None:
-                    inputs_embeds = self.word_embeddings(input_ids)
-                
-                embeddings = inputs_embeds + token_type_embeddings
-                embeddings = embeddings + self.position_embeddings(position_ids)
-                embeddings = self.LayerNorm(embeddings)
-                return self.dropout(embeddings)
-            
-            return super().forward(
-                input_ids=input_ids,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                past_key_values_length=past_key_values_length,
-            )
-
-    target_classes = tuple(c for c in (RobertaEmbeddings, XLMRobertaEmbeddings) if c is not None)
-
-    for _, module in model.named_modules():
-        if not isinstance(module, target_classes):
-            continue
-        if type(module) is _RobertaEmbeddingsSpyre:
-            continue  # already patched
-
-        module.__class__ = _RobertaEmbeddingsSpyre
-        logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
+# def _patch_xlm_roberta_gather(model: nn.Module) -> None:
+#     """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path on token segment IDs.
+#
+#     HF's standard forward has two branches for ``token_type_ids``:
+#     * buffer present  → ``torch.gather`` (aten::gather, not supported on Spyre layout remapper)
+#     * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32 downcast and
+#                          subsequent layout/ReStickifyOpHBM compile crash on Spyre)
+#
+#     Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token type, all IDs are 0
+#     and token_type_embeddings always returns weight[0] broadcasted.
+#     The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
+#     integer indexing lookup entirely, ensuring only float16/float32 operations exist.
+#
+#     ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
+#     Dynamo traces the clean, tensor-only replacement forward method seamlessly.
+#     """
+#     try:
+#         from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
+#     except ImportError:
+#         RobertaEmbeddings = None
+#
+#     try:
+#         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
+#             XLMRobertaEmbeddings,
+#         )
+#     except ImportError:
+#         XLMRobertaEmbeddings = None
+#
+#     base_class = RobertaEmbeddings or XLMRobertaEmbeddings
+#     if base_class is None:
+#         return
+#
+#     class _RobertaEmbeddingsSpyre(base_class):
+#         def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
+#                     inputs_embeds=None, past_key_values_length=0):
+#             if token_type_ids is None:
+#                 if input_ids is not None:
+#                     batch_size, seq_length = input_ids.shape
+#                     dev = input_ids.device
+#                 else:
+#                     batch_size, seq_length = inputs_embeds.shape[:2]
+#                     dev = inputs_embeds.device
+#                 token_type_embeddings = (
+#                     self.token_type_embeddings.weight[0]
+#                     .view(1, 1, -1)
+#                     .expand(batch_size, seq_length, -1)
+#                 )
+#                 if position_ids is None:
+#                     if input_ids is not None:
+#                         position_ids = self.create_position_ids_from_input_ids(
+#                             input_ids, self.padding_idx, past_key_values_length
+#                         )
+#                     else:
+#                         position_ids = self.create_position_ids_from_inputs_embeds(
+#                             inputs_embeds, self.padding_idx
+#                         )
+#                 if inputs_embeds is None:
+#                     inputs_embeds = self.word_embeddings(input_ids)
+#                 embeddings = inputs_embeds + token_type_embeddings
+#                 embeddings = embeddings + self.position_embeddings(position_ids)
+#                 embeddings = self.LayerNorm(embeddings)
+#                 return self.dropout(embeddings)
+#             return super().forward(
+#                 input_ids=input_ids,
+#                 token_type_ids=token_type_ids,
+#                 position_ids=position_ids,
+#                 inputs_embeds=inputs_embeds,
+#                 past_key_values_length=past_key_values_length,
+#             )
+#
+#     target_classes = tuple(c for c in (RobertaEmbeddings, XLMRobertaEmbeddings) if c is not None)
+#
+#     for _, module in model.named_modules():
+#         if not isinstance(module, target_classes):
+#             continue
+#         if type(module) is _RobertaEmbeddingsSpyre:
+#             continue
+#         module.__class__ = _RobertaEmbeddingsSpyre
+#         logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
 
 
-def _patch_distilbert_embeddings(model: nn.Module) -> None:
-    """Patch DistilBert Embeddings to avoid PyTorch Dynamo slicing bug on position_ids buffer.
-
-    During whole-model compilation/warmup, a fake tensor broadcasting mismatch is triggered:
-    mismatching shape [1, 512, 768] vs [1, 16, 768].
-    This occurs because PyTorch Dynamo/FakeTensor traces the slice `self.position_ids[:, :seq_length]`
-    with the static buffer's full length (512) rather than the dynamic sequence length (seq_length).
-    Overriding the embeddings class to generate position_ids dynamically avoids this slicing bug.
-    """
-    try:
-        from transformers.models.distilbert.modeling_distilbert import Embeddings
-    except ImportError:
-        return
-
-    class _DistilBertEmbeddingsSpyre(Embeddings):
-        def forward(
-            self,
-            input_ids: torch.Tensor,
-            inputs_embeds: torch.Tensor | None = None,
-            position_ids: torch.LongTensor | None = None,
-        ) -> torch.Tensor:
-            if input_ids is not None:
-                inputs_embeds = self.word_embeddings(input_ids)
-
-            seq_length = inputs_embeds.size(1)
-
-            # Generate position_ids dynamically to bypass the PyTorch Dynamo slicing bug on static buffers
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device)
-            position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.shape[0], seq_length)
-
-            position_embeddings = self.position_embeddings(position_ids)
-
-            embeddings = inputs_embeds + position_embeddings
-            embeddings = self.LayerNorm(embeddings)
-            return self.dropout(embeddings)
-
-    for _, module in model.named_modules():
-        if isinstance(module, Embeddings):
-            if type(module) is _DistilBertEmbeddingsSpyre:
-                continue
-            module.__class__ = _DistilBertEmbeddingsSpyre
-            logger.debug("Replaced %s with Spyre-compatible slice-safe subclass", type(module).__name__)
+# def _patch_distilbert_embeddings(model: nn.Module) -> None:
+#     """Patch DistilBert Embeddings to avoid PyTorch Dynamo slicing bug on position_ids buffer."""
+#     try:
+#         from transformers.models.distilbert.modeling_distilbert import Embeddings
+#     except ImportError:
+#         return
+#
+#     class _DistilBertEmbeddingsSpyre(Embeddings):
+#         def forward(
+#             self,
+#             input_ids: torch.Tensor,
+#             inputs_embeds: torch.Tensor | None = None,
+#             position_ids: torch.LongTensor | None = None,
+#         ) -> torch.Tensor:
+#             if input_ids is not None:
+#                 inputs_embeds = self.word_embeddings(input_ids)
+#             seq_length = inputs_embeds.size(1)
+#             position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device)
+#             position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.shape[0], seq_length)
+#             position_embeddings = self.position_embeddings(position_ids)
+#             embeddings = inputs_embeds + position_embeddings
+#             embeddings = self.LayerNorm(embeddings)
+#             return self.dropout(embeddings)
+#
+#     for _, module in model.named_modules():
+#         if isinstance(module, Embeddings):
+#             if type(module) is _DistilBertEmbeddingsSpyre:
+#                 continue
+#             module.__class__ = _DistilBertEmbeddingsSpyre
+#             logger.debug("Replaced %s with Spyre-compatible slice-safe subclass", type(module).__name__)
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
@@ -465,7 +444,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         result = super().load_weights(weights)
-        _patch_xlm_roberta_gather(self.model)
+        # _patch_xlm_roberta_gather(self.model)
         self._patch_rope()
         return result
 
@@ -577,7 +556,7 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
             logger.info("Dynamically instantiated pre_classifier and dropout submodules based on checkpoint weights")
 
         result = super().load_weights(weights_list)
-        _patch_distilbert_embeddings(self.model)
+        # _patch_distilbert_embeddings(self.model)
         self._patch_rope()
         return result
 
