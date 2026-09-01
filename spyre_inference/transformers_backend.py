@@ -436,72 +436,54 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # RoBERTa/XLM-RoBERTa checkpoints save position_ids as a persistent buffer;
-        # vLLM's loader rejects it as unexpected because the module registers it as
-        # non-persistent. Safe to ignore — it is recreated at runtime.
-        self.ignore_unexpected_suffixes.append("position_ids")
+        # self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug("SpyreTransformersEmbeddingModel ready: %s", type(self.model).__name__)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
-        # _patch_xlm_roberta_gather(self.model)
-        self._patch_rope()
-        return result
+    # def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    #     result = super().load_weights(weights)
+    #     # _patch_xlm_roberta_gather(self.model)
+    #     self._patch_rope()
+    #     return result
 
-    def _patch_rope(self):
-        """Swap HF's rotary embedding for the Spyre matmul-based one, if present.
-
-        Most encoder architectures (BERT, RoBERTa, XLM-RoBERTa) use absolute position
-        embeddings and have no ``rotary_emb`` on the model — for those this is a no-op.
-        NomicBERT / Granite-125m do use RoPE and go through the full patch path.
-        """
-        if not hasattr(self.model, "rotary_emb"):
-            return
-
-        cfg = getattr(self.model, "config", self.model.config)
-
-        rope_source = self.model.get_submodule("rotary_emb")
-        orig_head_dim = original_head_dim(cfg)
-        padded_head_dim = None
-        if orig_head_dim is not None:
-            padded_head_dim = cfg.head_dim
-            rope_source = _rope_at_original_head_dim(cfg, rope_source, orig_head_dim)
-
-        spyre_rope = _SpyreRotaryEmbedding(
-            rope_source,
-            self._max_position,
-            padded_head_dim,
-            next(self.model.parameters()).dtype,
-        )
-        self.model.rotary_emb = spyre_rope
-
-        patched_mods: set[int] = set()
-        for name, module in self.model.named_modules():
-            if module is spyre_rope:
-                continue
-
-            cls_name = module.__class__.__name__
-
-            if cls_name.endswith("RotaryEmbedding"):
-                parent_name, _, attr = name.rpartition(".")
-                parent = self.model.get_submodule(parent_name) if parent_name else self.model
-                setattr(parent, attr, spyre_rope)
-                continue
-
-            if "Attention" not in cls_name:
-                continue
-
-            if not hasattr(module, "rotary_emb"):
-                module.rotary_emb = spyre_rope
-
-            mod = sys.modules.get(type(module).__module__)
-            if mod is None or id(mod) in patched_mods:
-                continue
-            existing = getattr(mod, "apply_rotary_pos_emb", None)
-            if existing is None or getattr(existing, "_spyre_patched", False):
-                continue
-            mod.apply_rotary_pos_emb = _rope_dispatch(existing)
-            patched_mods.add(id(mod))
+    # def _patch_rope(self):
+    #     if not hasattr(self.model, "rotary_emb"):
+    #         return
+    #     cfg = getattr(self.model, "config", self.model.config)
+    #     rope_source = self.model.get_submodule("rotary_emb")
+    #     orig_head_dim = original_head_dim(cfg)
+    #     padded_head_dim = None
+    #     if orig_head_dim is not None:
+    #         padded_head_dim = cfg.head_dim
+    #         rope_source = _rope_at_original_head_dim(cfg, rope_source, orig_head_dim)
+    #     spyre_rope = _SpyreRotaryEmbedding(
+    #         rope_source,
+    #         self._max_position,
+    #         padded_head_dim,
+    #         next(self.model.parameters()).dtype,
+    #     )
+    #     self.model.rotary_emb = spyre_rope
+    #     patched_mods: set[int] = set()
+    #     for name, module in self.model.named_modules():
+    #         if module is spyre_rope:
+    #             continue
+    #         cls_name = module.__class__.__name__
+    #         if cls_name.endswith("RotaryEmbedding"):
+    #             parent_name, _, attr = name.rpartition(".")
+    #             parent = self.model.get_submodule(parent_name) if parent_name else self.model
+    #             setattr(parent, attr, spyre_rope)
+    #             continue
+    #         if "Attention" not in cls_name:
+    #             continue
+    #         if not hasattr(module, "rotary_emb"):
+    #             module.rotary_emb = spyre_rope
+    #         mod = sys.modules.get(type(module).__module__)
+    #         if mod is None or id(mod) in patched_mods:
+    #             continue
+    #         existing = getattr(mod, "apply_rotary_pos_emb", None)
+    #         if existing is None or getattr(existing, "_spyre_patched", False):
+    #             continue
+    #         mod.apply_rotary_pos_emb = _rope_dispatch(existing)
+    #         patched_mods.add(id(mod))
 
 
 # Same aliasing requirement as SpyreTransformersForCausalLM.
@@ -515,8 +497,7 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
         self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.ignore_unexpected_suffixes.append("position_ids")
-
+        # self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
@@ -542,9 +523,6 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         return self.classifier(pooled_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Convert weight generator to a list to inspect keys and reuse them.
-        # This makes the pre_classifier fix completely generic for any model
-        # architecture that carries pre_classifier parameters in its weights.
         weights_list = list(weights)
         if any("pre_classifier" in key for key, _ in weights_list) and not hasattr(self, "pre_classifier"):
             config = self.model.config
@@ -553,15 +531,13 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
             self.dropout = nn.Dropout(
                 p=getattr(config, "seq_classif_dropout", getattr(config, "dropout", 0.2))
             )
-            logger.info("Dynamically instantiated pre_classifier and dropout submodules based on checkpoint weights")
-
         result = super().load_weights(weights_list)
         # _patch_distilbert_embeddings(self.model)
-        self._patch_rope()
+        # self._patch_rope()
         return result
 
-    def _patch_rope(self):
-        SpyreTransformersEmbeddingModel._patch_rope(self)
+    # def _patch_rope(self):
+    #     SpyreTransformersEmbeddingModel._patch_rope(self)
 
 
 # Same aliasing requirement as SpyreTransformersForCausalLM.
