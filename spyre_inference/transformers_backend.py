@@ -180,15 +180,15 @@ def _rope_dispatch(original: Callable) -> Callable:
 
 
 # def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-#     """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a subclass that skips the ``gather`` path on token segment IDs.
+#     """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a gather-free subclass.
 #
 #     HF's standard forward has two branches for ``token_type_ids``:
-#     * buffer present  → ``torch.gather`` (aten::gather, not supported on Spyre layout remapper)
-#     * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32 downcast and
-#                          subsequent layout/ReStickifyOpHBM compile crash on Spyre)
+#     * buffer present  → ``torch.gather`` (not supported on Spyre layout remapper)
+#     * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32
+#                          downcast and ReStickifyOpHBM compile crash on Spyre)
 #
-#     Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token type, all IDs are 0
-#     and token_type_embeddings always returns weight[0] broadcasted.
+#     Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token
+#     type, all IDs are 0 and token_type_embeddings always returns weight[0] broadcasted.
 #     The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
 #     integer indexing lookup entirely, ensuring only float16/float32 operations exist.
 #
@@ -289,7 +289,10 @@ def _rope_dispatch(original: Callable) -> Callable:
 #             if type(module) is _DistilBertEmbeddingsSpyre:
 #                 continue
 #             module.__class__ = _DistilBertEmbeddingsSpyre
-#             logger.debug("Replaced %s with Spyre-compatible slice-safe subclass", type(module).__name__)
+#             logger.debug(
+#                 "Replaced %s with Spyre-compatible slice-safe subclass",
+#                 type(module).__name__,
+#             )
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
@@ -524,7 +527,8 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights_list = list(weights)
-        if any("pre_classifier" in key for key, _ in weights_list) and not hasattr(self, "pre_classifier"):
+        has_pre_classifier = any("pre_classifier" in key for key, _ in weights_list)
+        if has_pre_classifier and not hasattr(self, "pre_classifier"):
             config = self.model.config
             hidden_size = getattr(config, "dim", getattr(config, "hidden_size", 768))
             self.pre_classifier = nn.Linear(hidden_size, hidden_size)
