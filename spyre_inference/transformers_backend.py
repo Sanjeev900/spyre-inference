@@ -179,85 +179,85 @@ def _rope_dispatch(original: Callable) -> Callable:
     return apply_rotary_pos_emb
 
 
-# def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-#     """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a gather-free subclass.
-#
-#     HF's standard forward has two branches for ``token_type_ids``:
-#     * buffer present  → ``torch.gather`` (not supported on Spyre layout remapper)
-#     * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32
-#                          downcast and ReStickifyOpHBM compile crash on Spyre)
-#
-#     Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token
-#     type, all IDs are 0 and token_type_embeddings always returns weight[0] broadcasted.
-#     The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
-#     integer indexing lookup entirely, ensuring only float16/float32 operations exist.
-#
-#     ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
-#     Dynamo traces the clean, tensor-only replacement forward method seamlessly.
-#     """
-#     try:
-#         from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
-#     except ImportError:
-#         RobertaEmbeddings = None
-#
-#     try:
-#         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
-#             XLMRobertaEmbeddings,
-#         )
-#     except ImportError:
-#         XLMRobertaEmbeddings = None
-#
-#     base_class = RobertaEmbeddings or XLMRobertaEmbeddings
-#     if base_class is None:
-#         return
-#
-#     class _RobertaEmbeddingsSpyre(base_class):
-#         def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
-#                     inputs_embeds=None, past_key_values_length=0):
-#             if token_type_ids is None:
-#                 if input_ids is not None:
-#                     batch_size, seq_length = input_ids.shape
-#                     dev = input_ids.device
-#                 else:
-#                     batch_size, seq_length = inputs_embeds.shape[:2]
-#                     dev = inputs_embeds.device
-#                 token_type_embeddings = (
-#                     self.token_type_embeddings.weight[0]
-#                     .view(1, 1, -1)
-#                     .expand(batch_size, seq_length, -1)
-#                 )
-#                 if position_ids is None:
-#                     if input_ids is not None:
-#                         position_ids = self.create_position_ids_from_input_ids(
-#                             input_ids, self.padding_idx, past_key_values_length
-#                         )
-#                     else:
-#                         position_ids = self.create_position_ids_from_inputs_embeds(
-#                             inputs_embeds, self.padding_idx
-#                         )
-#                 if inputs_embeds is None:
-#                     inputs_embeds = self.word_embeddings(input_ids)
-#                 embeddings = inputs_embeds + token_type_embeddings
-#                 embeddings = embeddings + self.position_embeddings(position_ids)
-#                 embeddings = self.LayerNorm(embeddings)
-#                 return self.dropout(embeddings)
-#             return super().forward(
-#                 input_ids=input_ids,
-#                 token_type_ids=token_type_ids,
-#                 position_ids=position_ids,
-#                 inputs_embeds=inputs_embeds,
-#                 past_key_values_length=past_key_values_length,
-#             )
-#
-#     target_classes = tuple(c for c in (RobertaEmbeddings, XLMRobertaEmbeddings) if c is not None)
-#
-#     for _, module in model.named_modules():
-#         if not isinstance(module, target_classes):
-#             continue
-#         if type(module) is _RobertaEmbeddingsSpyre:
-#             continue
-#         module.__class__ = _RobertaEmbeddingsSpyre
-#         logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
+def _patch_xlm_roberta_gather(model: nn.Module) -> None:
+    """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a gather-free subclass.
+
+    HF's standard forward has two branches for ``token_type_ids``:
+    * buffer present  → ``torch.gather`` (not supported on Spyre layout remapper)
+    * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32
+                         downcast and ReStickifyOpHBM compile crash on Spyre)
+
+    Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token
+    type, all IDs are 0 and token_type_embeddings always returns weight[0] broadcasted.
+    The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
+    integer indexing lookup entirely, ensuring only float16/float32 operations exist.
+
+    ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
+    Dynamo traces the clean, tensor-only replacement forward method seamlessly.
+    """
+    try:
+        from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
+    except ImportError:
+        RobertaEmbeddings = None
+
+    try:
+        from transformers.models.xlm_roberta.modeling_xlm_roberta import (
+            XLMRobertaEmbeddings,
+        )
+    except ImportError:
+        XLMRobertaEmbeddings = None
+
+    base_class = RobertaEmbeddings or XLMRobertaEmbeddings
+    if base_class is None:
+        return
+
+    class _RobertaEmbeddingsSpyre(base_class):  # type: ignore[valid-type,misc]
+        def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
+                    inputs_embeds=None, past_key_values_length=0):
+            if token_type_ids is None:
+                if input_ids is not None:
+                    batch_size, seq_length = input_ids.shape
+                    dev = input_ids.device
+                else:
+                    batch_size, seq_length = inputs_embeds.shape[:2]
+                    dev = inputs_embeds.device
+                token_type_embeddings = (
+                    self.token_type_embeddings.weight[0]
+                    .view(1, 1, -1)
+                    .expand(batch_size, seq_length, -1)
+                )
+                if position_ids is None:
+                    if input_ids is not None:
+                        position_ids = self.create_position_ids_from_input_ids(
+                            input_ids, self.padding_idx, past_key_values_length
+                        )
+                    else:
+                        position_ids = self.create_position_ids_from_inputs_embeds(
+                            inputs_embeds, self.padding_idx
+                        )
+                if inputs_embeds is None:
+                    inputs_embeds = self.word_embeddings(input_ids)
+                embeddings = inputs_embeds + token_type_embeddings
+                embeddings = embeddings + self.position_embeddings(position_ids)
+                embeddings = self.LayerNorm(embeddings)
+                return self.dropout(embeddings)
+            return super().forward(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                past_key_values_length=past_key_values_length,
+            )
+
+    target_classes = tuple(c for c in (RobertaEmbeddings, XLMRobertaEmbeddings) if c is not None)
+
+    for _, module in model.named_modules():
+        if not isinstance(module, target_classes):
+            continue
+        if type(module) is _RobertaEmbeddingsSpyre:
+            continue
+        module.__class__ = _RobertaEmbeddingsSpyre
+        logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
 
 
 # def _patch_distilbert_embeddings(model: nn.Module) -> None:
@@ -427,67 +427,18 @@ SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
 
 
 class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
-    """Transformers backend for pooling/embed models with the Spyre RoPE replacement.
-
-    Encoder models that use absolute position embeddings (BERT, RoBERTa, XLM-RoBERTa)
-    have no ``rotary_emb`` on their backbone; ``_patch_rope`` is a no-op for them.
-    Models that do use RoPE (e.g. NomicBERT / Granite-125m) go through the same
-    matmul-based rotation as the decoder adapter.
-    """
+    """Transformers backend for encoder pooling models on Spyre."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
-        self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug("SpyreTransformersEmbeddingModel ready: %s", type(self.model).__name__)
 
-    # def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-    #     result = super().load_weights(weights)
-    #     # _patch_xlm_roberta_gather(self.model)
-    #     self._patch_rope()
-    #     return result
-
-    # def _patch_rope(self):
-    #     if not hasattr(self.model, "rotary_emb"):
-    #         return
-    #     cfg = getattr(self.model, "config", self.model.config)
-    #     rope_source = self.model.get_submodule("rotary_emb")
-    #     orig_head_dim = original_head_dim(cfg)
-    #     padded_head_dim = None
-    #     if orig_head_dim is not None:
-    #         padded_head_dim = cfg.head_dim
-    #         rope_source = _rope_at_original_head_dim(cfg, rope_source, orig_head_dim)
-    #     spyre_rope = _SpyreRotaryEmbedding(
-    #         rope_source,
-    #         self._max_position,
-    #         padded_head_dim,
-    #         next(self.model.parameters()).dtype,
-    #     )
-    #     self.model.rotary_emb = spyre_rope
-    #     patched_mods: set[int] = set()
-    #     for name, module in self.model.named_modules():
-    #         if module is spyre_rope:
-    #             continue
-    #         cls_name = module.__class__.__name__
-    #         if cls_name.endswith("RotaryEmbedding"):
-    #             parent_name, _, attr = name.rpartition(".")
-    #             parent = self.model.get_submodule(parent_name) if parent_name else self.model
-    #             setattr(parent, attr, spyre_rope)
-    #             continue
-    #         if "Attention" not in cls_name:
-    #             continue
-    #         if not hasattr(module, "rotary_emb"):
-    #             module.rotary_emb = spyre_rope
-    #         mod = sys.modules.get(type(module).__module__)
-    #         if mod is None or id(mod) in patched_mods:
-    #             continue
-    #         existing = getattr(mod, "apply_rotary_pos_emb", None)
-    #         if existing is None or getattr(existing, "_spyre_patched", False):
-    #             continue
-    #         mod.apply_rotary_pos_emb = _rope_dispatch(existing)
-    #         patched_mods.add(id(mod))
-
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        hf_model = self.model.model if hasattr(self.model, "model") else self.model
+        _patch_xlm_roberta_gather(hf_model)
+        return result
 
 # Same aliasing requirement as SpyreTransformersForCausalLM.
 SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
