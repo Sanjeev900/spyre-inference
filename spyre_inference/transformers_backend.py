@@ -466,7 +466,6 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         result = super().load_weights(weights)
         _patch_xlm_roberta_gather(self.model)
-        _patch_distilbert_embeddings(self.model)
         self._patch_rope()
         return result
 
@@ -578,7 +577,6 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
             logger.info("Dynamically instantiated pre_classifier and dropout submodules based on checkpoint weights")
 
         result = super().load_weights(weights_list)
-        _patch_xlm_roberta_gather(self.model)
         _patch_distilbert_embeddings(self.model)
         self._patch_rope()
         return result
