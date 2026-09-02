@@ -595,6 +595,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "(MLA, encoder-only vision towers) take this path.",
                 model_name,
             )
+            # torch-spyre bug: _preserve_shared_weight_unit_bmm_dim in
+            # spyre_kernel.py guards only device_size > 4 (commit 611a77b),
+            # but DistilBERT's fused QKV produces rank-4 tiled buffers
+            # (device_size=[16,36,1,64]), which slip through and crash with
+            # "alignment input collection disagrees with tensor codegen".
+            # Skip whole-model compile for pooling models until the guard is
+            # tightened to >= 4 upstream.
+            if self.model_config.runner_type == "pooling":
+                return
 
         self.model = torch.compile(
             self.model,
