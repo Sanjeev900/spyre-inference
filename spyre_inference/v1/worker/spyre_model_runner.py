@@ -595,6 +595,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "(MLA, encoder-only vision towers) take this path.",
                 model_name,
             )
+            if self.model_config.runner_type == "pooling":
+                return
 
         self.model = torch.compile(
             self.model,
