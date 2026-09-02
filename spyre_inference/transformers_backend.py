@@ -190,9 +190,7 @@ def _stamp_layer_idx(model: nn.Module) -> None:
     """
     idx = 0
     for module in model.modules():
-        if type(module).__name__.endswith("SelfAttention") and not hasattr(
-            module, "layer_idx"
-        ):
+        if type(module).__name__.endswith("SelfAttention") and not hasattr(module, "layer_idx"):
             module.layer_idx = idx
             idx += 1
 
@@ -218,6 +216,7 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
         from transformers.models.roberta.modeling_roberta import (
             RobertaEmbeddings as _RobertaEmbeddings,
         )
+
         RobertaEmbeddings = _RobertaEmbeddings
     except ImportError:
         pass
@@ -227,6 +226,7 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings as _XLMRobertaEmbeddings,
         )
+
         XLMRobertaEmbeddings = _XLMRobertaEmbeddings
     except ImportError:
         pass
@@ -497,10 +497,9 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
             )
         for name in ("pre_classifier",):
             module = getattr(seq_cls_model, name, None)
-            if module is not None and not hasattr(self, name):
-                if list(module.parameters()):
-                    setattr(self, name, module)
-                    self.init_parameters(module)
+            if module is not None and not hasattr(self, name) and list(module.parameters()):
+                setattr(self, name, module)
+                self.init_parameters(module)
 
         # DistilBERT's DistilBertSelfAttention does not set layer_idx (unlike
         # BertSelfAttention), but vllm_attention_forward requires it to look up
