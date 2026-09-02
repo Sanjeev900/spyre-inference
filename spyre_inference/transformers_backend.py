@@ -503,6 +503,16 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         # matches the attention_instances dict built by create_attention_instances.
         _stamp_layer_idx(self.model)
 
+        # SequenceClassificationMixin wraps self.classifier with ClassifierWithReshape
+        # which unsqueezes input to [batch, 1, hidden] before calling forward. This is
+        # correct for classifiers that expect a sequence dim, but plain nn.Linear
+        # (e.g. DistilBERT) broadcasts the extra dim through, producing [batch, 1,
+        # num_labels] output that fails ClassificationOutput's 1-D check. Revert to
+        # the original class when the base is nn.Linear.
+        original_cls = type(self.classifier).__bases__[0]
+        if issubclass(original_cls, nn.Linear):
+            self.classifier.__class__ = original_cls
+
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
