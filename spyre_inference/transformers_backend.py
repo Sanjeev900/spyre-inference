@@ -195,11 +195,13 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
     Dynamo traces the clean, tensor-only replacement forward method seamlessly.
     """
+    RobertaEmbeddings: type | None
     try:
         from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
     except ImportError:
         RobertaEmbeddings = None
 
+    XLMRobertaEmbeddings: type | None
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings,
@@ -224,6 +226,7 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
                 if input_ids is not None:
                     batch_size, seq_length = input_ids.shape
                 else:
+                    assert inputs_embeds is not None
                     batch_size, seq_length = inputs_embeds.shape[:2]
                 token_type_embeddings = (
                     self.token_type_embeddings.weight[0]
@@ -462,7 +465,7 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
             type(self.model).__name__,
         )
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
