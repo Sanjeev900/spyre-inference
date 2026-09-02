@@ -458,8 +458,27 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
     """Transformers backend for pooling/classify (reranker) models on Spyre."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        from transformers import AutoModelForSequenceClassification
+
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # SequenceClassificationMixin only extracts `classifier` from the
+        # ForSequenceClassification model. Models like DistilBERT have
+        # additional head layers (pre_classifier, dropout) that must be
+        # registered so the weight loader can place their checkpoint weights.
+        with torch.device("meta"):
+            seq_cls_model = AutoModelForSequenceClassification.from_config(
+                self.model.config,
+                dtype=self.model_config.dtype,
+                trust_remote_code=self.model_config.trust_remote_code,
+            )
+        for name in ("pre_classifier", "dropout"):
+            module = getattr(seq_cls_model, name, None)
+            if module is not None and not hasattr(self, name):
+                setattr(self, name, module)
+                self.init_parameters(module)
+
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
