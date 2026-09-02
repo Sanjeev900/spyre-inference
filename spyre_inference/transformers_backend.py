@@ -216,16 +216,18 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     RobertaEmbeddings: type | None = None
     try:
         from transformers.models.roberta.modeling_roberta import (
-            RobertaEmbeddings as RobertaEmbeddings,
+            RobertaEmbeddings as _RobertaEmbeddings,
         )
+        RobertaEmbeddings = _RobertaEmbeddings
     except ImportError:
         pass
 
     XLMRobertaEmbeddings: type | None = None
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
-            XLMRobertaEmbeddings as XLMRobertaEmbeddings,
+            XLMRobertaEmbeddings as _XLMRobertaEmbeddings,
         )
+        XLMRobertaEmbeddings = _XLMRobertaEmbeddings
     except ImportError:
         pass
 
