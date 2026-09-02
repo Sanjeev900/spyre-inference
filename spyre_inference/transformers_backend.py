@@ -195,19 +195,17 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
     Dynamo traces the clean, tensor-only replacement forward method seamlessly.
     """
-    RobertaEmbeddings: type | None
     try:
         from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
     except ImportError:
-        RobertaEmbeddings = None
+        RobertaEmbeddings = None  # type: ignore[assignment,misc]
 
-    XLMRobertaEmbeddings: type | None
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings,
         )
     except ImportError:
-        XLMRobertaEmbeddings = None
+        XLMRobertaEmbeddings = None  # type: ignore[assignment,misc]
 
     base_class = RobertaEmbeddings or XLMRobertaEmbeddings
     if base_class is None:
