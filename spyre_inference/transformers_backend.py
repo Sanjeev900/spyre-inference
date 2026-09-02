@@ -29,7 +29,7 @@ from __future__ import annotations
 import functools
 import sys
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -195,17 +195,21 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
     Dynamo traces the clean, tensor-only replacement forward method seamlessly.
     """
+    RobertaEmbeddings: type | None = None
     try:
-        from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
-    except ImportError:
-        RobertaEmbeddings = None  # type: ignore[assignment,misc]
-
-    try:
-        from transformers.models.xlm_roberta.modeling_xlm_roberta import (
-            XLMRobertaEmbeddings,
+        from transformers.models.roberta.modeling_roberta import (
+            RobertaEmbeddings as RobertaEmbeddings,
         )
     except ImportError:
-        XLMRobertaEmbeddings = None  # type: ignore[assignment,misc]
+        pass
+
+    XLMRobertaEmbeddings: type | None = None
+    try:
+        from transformers.models.xlm_roberta.modeling_xlm_roberta import (
+            XLMRobertaEmbeddings as XLMRobertaEmbeddings,
+        )
+    except ImportError:
+        pass
 
     base_class = RobertaEmbeddings or XLMRobertaEmbeddings
     if base_class is None:
@@ -455,51 +459,11 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
-        self._max_position = vllm_config.model_config.max_model_len
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # self.ignore_unexpected_suffixes.append("position_ids")
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
         )
-
-    def forward(  # type: ignore[override]
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: list[torch.Tensor] | None = None,
-        attn_metadata: Any = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        import torch.nn.functional as F
-
-        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, **kwargs)
-        pooled_states = self.pooler(hidden_states, attn_metadata)
-
-        if hasattr(self, "pre_classifier"):
-            pooled_states = self.pre_classifier(pooled_states)
-            pooled_states = F.relu(pooled_states)
-            pooled_states = self.dropout(pooled_states)
-
-        return self.classifier(pooled_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights_list = list(weights)
-        has_pre_classifier = any("pre_classifier" in key for key, _ in weights_list)
-        if has_pre_classifier and not hasattr(self, "pre_classifier"):
-            config = self.model.config
-            hidden_size = getattr(config, "dim", getattr(config, "hidden_size", 768))
-            self.pre_classifier = nn.Linear(hidden_size, hidden_size)
-            self.dropout = nn.Dropout(
-                p=getattr(config, "seq_classif_dropout", getattr(config, "dropout", 0.2))
-            )
-        result = super().load_weights(weights_list)
-        # _patch_distilbert_embeddings(self.model)
-        # self._patch_rope()
-        return result
-
-    # def _patch_rope(self):
-    #     SpyreTransformersEmbeddingModel._patch_rope(self)
 
 
 # Same aliasing requirement as SpyreTransformersForCausalLM.
