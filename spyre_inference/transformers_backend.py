@@ -212,8 +212,14 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
         return
 
     class _RobertaEmbeddingsSpyre(base_class):  # type: ignore[valid-type,misc]
-        def forward(self, input_ids=None, token_type_ids=None, position_ids=None,
-                    inputs_embeds=None, past_key_values_length=0):
+        def forward(
+            self,
+            input_ids=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            past_key_values_length=0,
+        ):
             if token_type_ids is None:
                 if input_ids is not None:
                     batch_size, seq_length = input_ids.shape
@@ -438,6 +444,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
         _patch_xlm_roberta_gather(hf_model)
         return result
 
+
 # Same aliasing requirement as SpyreTransformersForCausalLM.
 SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
 
@@ -464,6 +471,7 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         **kwargs,
     ) -> torch.Tensor:
         import torch.nn.functional as F
+
         hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, **kwargs)
         pooled_states = self.pooler(hidden_states, attn_metadata)
 
