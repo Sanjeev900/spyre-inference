@@ -179,6 +179,24 @@ def _rope_dispatch(original: Callable) -> Callable:
     return apply_rotary_pos_emb
 
 
+def _stamp_layer_idx(model: nn.Module) -> None:
+    """Stamp ``layer_idx`` on attention modules that lack it.
+
+    DistilBertSelfAttention participates in HuggingFace's ALL_ATTENTION_FUNCTIONS
+    dispatch (so vllm_attention_forward is called) but never sets layer_idx —
+    unlike BertSelfAttention which accepts it as a constructor arg. Walk the
+    model in named_modules order and assign sequential indices to any attention
+    module missing the attribute.
+    """
+    idx = 0
+    for module in model.modules():
+        if type(module).__name__.endswith("SelfAttention") and not hasattr(
+            module, "layer_idx"
+        ):
+            module.layer_idx = idx
+            idx += 1
+
+
 def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a gather-free subclass.
 
@@ -478,6 +496,12 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
             if module is not None and not hasattr(self, name):
                 setattr(self, name, module)
                 self.init_parameters(module)
+
+        # DistilBERT's DistilBertSelfAttention does not set layer_idx (unlike
+        # BertSelfAttention), but vllm_attention_forward requires it to look up
+        # the attention instance. Stamp it here in traversal order so the index
+        # matches the attention_instances dict built by create_attention_instances.
+        _stamp_layer_idx(self.model)
 
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
