@@ -195,98 +195,103 @@ def _stamp_layer_idx(model: nn.Module) -> None:
             idx += 1
 
 
-def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-    """Swap ``RobertaEmbeddings`` or ``XLMRobertaEmbeddings`` for a gather-free subclass.
+def _gather_free_forward(
+    self: nn.Module,
+    input_ids=None,
+    token_type_ids=None,
+    position_ids=None,
+    inputs_embeds=None,
+    past_key_values_length=0,
+):
+    """Forward that bypasses HF's token_type_ids integer-indexing branches.
 
-    HF's standard forward has two branches for ``token_type_ids``:
+    HF's RobertaEmbeddings/XLMRobertaEmbeddings forward has two branches for
+    ``token_type_ids``:
     * buffer present  → ``torch.gather`` (not supported on Spyre layout remapper)
     * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32
                          downcast and ReStickifyOpHBM compile crash on Spyre)
 
-    Neither branch compiles on Spyre. Since XLM-RoBERTa / RoBERTa only has one token
-    type, all IDs are 0 and token_type_embeddings always returns weight[0] broadcasted.
-    The subclass overrides ``forward`` to directly slice and expand weight[0], bypassing the
-    integer indexing lookup entirely, ensuring only float16/float32 operations exist.
-
-    ``module.__class__`` is rewritten in-place before compilation so all state is preserved and
-    Dynamo traces the clean, tensor-only replacement forward method seamlessly.
+    RoBERTa / XLM-RoBERTa only has one token type, so the result is always weight[0]
+    broadcast. This forward slices and expands weight[0] directly, keeping the graph
+    float-only.
     """
-    RobertaEmbeddings: type | None = None
+    if input_ids is not None:
+        batch_size, seq_length = input_ids.shape
+    else:
+        assert inputs_embeds is not None
+        batch_size, seq_length = inputs_embeds.shape[:2]
+    token_type_embeddings = (
+        self.token_type_embeddings.weight[0].view(1, 1, -1).expand(batch_size, seq_length, -1)
+    )
+    if position_ids is None:
+        if input_ids is not None:
+            position_ids = self.create_position_ids_from_input_ids(
+                input_ids, self.padding_idx, past_key_values_length
+            )
+        else:
+            position_ids = self.create_position_ids_from_inputs_embeds(
+                inputs_embeds, self.padding_idx
+            )
+    if inputs_embeds is None:
+        inputs_embeds = self.word_embeddings(input_ids)
+    embeddings = inputs_embeds + token_type_embeddings
+    embeddings = embeddings + self.position_embeddings(position_ids)
+    embeddings = self.LayerNorm(embeddings)
+    return self.dropout(embeddings)
+
+
+def _patch_xlm_roberta_gather(model: nn.Module) -> None:
+    """Replace ``RobertaEmbeddings`` / ``XLMRobertaEmbeddings`` child modules with
+    gather-free subclasses.
+
+    The replacement is done by swapping the child module on the parent (standard PyTorch
+    pattern) rather than mutating ``__class__`` in-place.
+    """
     try:
         from transformers.models.roberta.modeling_roberta import (
             RobertaEmbeddings as _RobertaEmbeddings,
         )
 
-        RobertaEmbeddings = _RobertaEmbeddings
-    except ImportError:
-        pass
+        class _RobertaEmbeddingsSpyre(_RobertaEmbeddings):
+            forward = _gather_free_forward  # type: ignore[assignment]
 
-    XLMRobertaEmbeddings: type | None = None
+    except ImportError:
+        _RobertaEmbeddings = None
+        _RobertaEmbeddingsSpyre = None  # type: ignore[assignment]
+
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings as _XLMRobertaEmbeddings,
         )
 
-        XLMRobertaEmbeddings = _XLMRobertaEmbeddings
-    except ImportError:
-        pass
+        class _XLMRobertaEmbeddingsSpyre(_XLMRobertaEmbeddings):
+            forward = _gather_free_forward  # type: ignore[assignment]
 
-    base_class = RobertaEmbeddings or XLMRobertaEmbeddings
-    if base_class is None:
+    except ImportError:
+        _XLMRobertaEmbeddings = None
+        _XLMRobertaEmbeddingsSpyre = None  # type: ignore[assignment]
+
+    replacements: list[tuple[type, type]] = []
+    if _RobertaEmbeddings is not None:
+        replacements.append((_RobertaEmbeddings, _RobertaEmbeddingsSpyre))
+    if _XLMRobertaEmbeddings is not None:
+        replacements.append((_XLMRobertaEmbeddings, _XLMRobertaEmbeddingsSpyre))
+    if not replacements:
         return
 
-    class _RobertaEmbeddingsSpyre(base_class):  # type: ignore[valid-type,misc]
-        def forward(
-            self,
-            input_ids=None,
-            token_type_ids=None,
-            position_ids=None,
-            inputs_embeds=None,
-            past_key_values_length=0,
-        ):
-            if token_type_ids is None:
-                if input_ids is not None:
-                    batch_size, seq_length = input_ids.shape
-                else:
-                    assert inputs_embeds is not None
-                    batch_size, seq_length = inputs_embeds.shape[:2]
-                token_type_embeddings = (
-                    self.token_type_embeddings.weight[0]
-                    .view(1, 1, -1)
-                    .expand(batch_size, seq_length, -1)
-                )
-                if position_ids is None:
-                    if input_ids is not None:
-                        position_ids = self.create_position_ids_from_input_ids(
-                            input_ids, self.padding_idx, past_key_values_length
-                        )
-                    else:
-                        position_ids = self.create_position_ids_from_inputs_embeds(
-                            inputs_embeds, self.padding_idx
-                        )
-                if inputs_embeds is None:
-                    inputs_embeds = self.word_embeddings(input_ids)
-                embeddings = inputs_embeds + token_type_embeddings
-                embeddings = embeddings + self.position_embeddings(position_ids)
-                embeddings = self.LayerNorm(embeddings)
-                return self.dropout(embeddings)
-            return super().forward(
-                input_ids=input_ids,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                past_key_values_length=past_key_values_length,
-            )
-
-    target_classes = tuple(c for c in (RobertaEmbeddings, XLMRobertaEmbeddings) if c is not None)
-
-    for _, module in model.named_modules():
-        if not isinstance(module, target_classes):
-            continue
-        if type(module) is _RobertaEmbeddingsSpyre:
-            continue
-        module.__class__ = _RobertaEmbeddingsSpyre
-        logger.debug("Replaced %s with gather-free subclass", type(module).__name__)
+    for parent_name, parent in model.named_modules():
+        for child_name, child in list(parent.named_children()):
+            for base_cls, spyre_cls in replacements:
+                if type(child) is base_cls:
+                    new_child = spyre_cls.__new__(spyre_cls)
+                    new_child.__dict__ = child.__dict__
+                    setattr(parent, child_name, new_child)
+                    logger.debug(
+                        "%s.%s: replaced %s with gather-free subclass",
+                        parent_name or "model",
+                        child_name,
+                        base_cls.__name__,
+                    )
 
 
 # def _patch_distilbert_embeddings(model: nn.Module) -> None:

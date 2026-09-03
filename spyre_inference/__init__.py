@@ -38,6 +38,8 @@ def register_ops():
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
 
+    # Install Spyre OOT custom op kernels (linear, rms_norm, rotary_embedding, etc.)
+    # into PyTorch's dispatcher so the compiler can lower them to Spyre hardware ops.
     register_all()
     register_models()
 
