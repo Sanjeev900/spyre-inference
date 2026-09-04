@@ -140,6 +140,24 @@ tests:
               model:
                 - BAAI/bge-base-en-v1.5
                 - sentence-transformers/all-MiniLM-L12-v2
+                # TransformersEmbeddingModel path (model_impl='transformers').
+                # Has a known aten.gather FallbackWarning during warmup; passes numerically.
+                # Remove comment once torch-spyre adds an aten.gather inductor lowering.
+                - ibm-granite/granite-embedding-278m-multilingual
+
+    - rel_path: tests/models/language/pooling/test_classification.py
+      allow_list:
+        - test: "test_models"
+          # mode: skip — aten.gather CPU fallback in legacy.py causes FallbackWarning
+          # during warmup; flip to mandatory_pass once torch-spyre adds an
+          # aten.gather inductor lowering.
+          mode: skip
+          tags: [model, classification, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - distilbert/distilbert-base-uncased-finetuned-sst-2-english
+              dtype: [float]
 
     - rel_path: tests/models/language/pooling/test_auto_prefix_cache_support.py
       allow_list:
