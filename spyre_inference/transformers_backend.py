@@ -294,41 +294,6 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
                     )
 
 
-# def _patch_distilbert_embeddings(model: nn.Module) -> None:
-#     """Patch DistilBert Embeddings to avoid PyTorch Dynamo slicing bug on position_ids buffer."""
-#     try:
-#         from transformers.models.distilbert.modeling_distilbert import Embeddings
-#     except ImportError:
-#         return
-#
-#     class _DistilBertEmbeddingsSpyre(Embeddings):
-#         def forward(
-#             self,
-#             input_ids: torch.Tensor,
-#             inputs_embeds: torch.Tensor | None = None,
-#             position_ids: torch.LongTensor | None = None,
-#         ) -> torch.Tensor:
-#             if input_ids is not None:
-#                 inputs_embeds = self.word_embeddings(input_ids)
-#             seq_length = inputs_embeds.size(1)
-#             position_ids = torch.arange(seq_length, dtype=torch.long, device=inputs_embeds.device)
-#             position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.shape[0], seq_length)
-#             position_embeddings = self.position_embeddings(position_ids)
-#             embeddings = inputs_embeds + position_embeddings
-#             embeddings = self.LayerNorm(embeddings)
-#             return self.dropout(embeddings)
-#
-#     for _, module in model.named_modules():
-#         if isinstance(module, Embeddings):
-#             if type(module) is _DistilBertEmbeddingsSpyre:
-#                 continue
-#             module.__class__ = _DistilBertEmbeddingsSpyre
-#             logger.debug(
-#                 "Replaced %s with Spyre-compatible slice-safe subclass",
-#                 type(module).__name__,
-#             )
-
-
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
     """Rebuild *rope* at the pre-pad head_dim.
 
