@@ -273,8 +273,10 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
 
     replacements: list[tuple[type, type]] = []
     if _RobertaEmbeddings is not None:
+        assert _RobertaEmbeddingsSpyre is not None
         replacements.append((_RobertaEmbeddings, _RobertaEmbeddingsSpyre))
     if _XLMRobertaEmbeddings is not None:
+        assert _XLMRobertaEmbeddingsSpyre is not None
         replacements.append((_XLMRobertaEmbeddings, _XLMRobertaEmbeddingsSpyre))
     if not replacements:
         return
@@ -283,7 +285,7 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
         for child_name, child in list(parent.named_children()):
             for base_cls, spyre_cls in replacements:
                 if type(child) is base_cls:
-                    new_child = spyre_cls.__new__(spyre_cls)
+                    new_child = cast(object, spyre_cls).__new__(spyre_cls)
                     new_child.__dict__ = child.__dict__
                     setattr(parent, child_name, new_child)
                     logger.debug(
