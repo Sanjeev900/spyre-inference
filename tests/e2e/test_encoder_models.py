@@ -51,6 +51,16 @@ LAST_POOLING_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
 ]
 
+# Sequence classifiers via model_impl='transformers' (TransformersForSequenceClassification).
+CLASSIFY_MODELS = [
+    "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+]
+
+CLASSIFY_PROMPTS = [
+    "This movie is great!",
+    "This movie is terrible!",
+]
+
 # Cross-encoder reranker smoke (classify / score path). One model is enough —
 # both BGE variants share XLMRobertaForSequenceClassification.
 RERANKER_MODELS = [
@@ -219,6 +229,26 @@ def test_encoder_rerank_models(model: str) -> None:
     scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
     assert len(scores) == 1
     assert math.isfinite(scores[0].outputs.score)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", CLASSIFY_MODELS)
+def test_encoder_classify_models(model: str) -> None:
+    """TransformersForSequenceClassification: probabilities are valid and sum to 1."""
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=len(CLASSIFY_PROMPTS),
+        model_impl="transformers",
+    )
+    outputs = llm.classify(CLASSIFY_PROMPTS)
+    assert len(outputs) == len(CLASSIFY_PROMPTS)
+    for out in outputs:
+        probs = out.outputs.probs
+        assert len(probs) > 0
+        assert all(math.isfinite(p) for p in probs)
+        assert abs(sum(probs) - 1.0) < 1e-3
 
 
 @pytest.mark.uses_subprocess

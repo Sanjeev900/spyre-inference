@@ -399,3 +399,130 @@ def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
 
     assert vllm_config.model_config.hf_config is before
     assert vllm_config.load_config.load_format == "auto"
+
+
+def test_stamp_layer_idx_assigns_sequential_indices():
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _stamp_layer_idx
+
+    class FakeSelfAttention(nn.Module):
+        pass
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = FakeSelfAttention()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = Block()
+            self.layer1 = Block()
+
+    model = Model()
+    assert not hasattr(model.layer0.attention, "layer_idx")
+    assert not hasattr(model.layer1.attention, "layer_idx")
+
+    _stamp_layer_idx(model)
+
+    assert model.layer0.attention.layer_idx == 0
+    assert model.layer1.attention.layer_idx == 1
+
+
+def test_stamp_layer_idx_skips_modules_that_already_have_it():
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _stamp_layer_idx
+
+    class FakeSelfAttention(nn.Module):
+        def __init__(self, idx):
+            super().__init__()
+            self.layer_idx = idx
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = FakeSelfAttention(99)
+
+    model = Model()
+    _stamp_layer_idx(model)
+    assert model.attn.layer_idx == 99
+
+
+def test_gather_free_forward_matches_weight0_expand():
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _gather_free_forward
+
+    embed_dim = 8
+    vocab_size = 16
+    seq_len = 4
+
+    torch.manual_seed(0)
+    word_emb = nn.Embedding(vocab_size, embed_dim)
+    pos_emb = nn.Embedding(32, embed_dim)
+    tte = nn.Embedding(2, embed_dim)
+    layer_norm = nn.LayerNorm(embed_dim)
+    dropout = nn.Dropout(0.0)
+
+    # weight[0] broadcast — what the function should compute
+    input_ids = torch.randint(0, vocab_size, (1, seq_len))
+    position_ids = torch.arange(2, 2 + seq_len).unsqueeze(0)
+    inputs_embeds = word_emb(input_ids)
+    expected_tte = tte.weight[0].view(1, 1, -1).expand(1, seq_len, -1)
+    pos_out = pos_emb(position_ids)
+    expected = layer_norm(inputs_embeds + expected_tte + pos_out)
+
+    # fake self with the attributes _gather_free_forward accesses
+    self = types.SimpleNamespace(
+        token_type_embeddings=tte,
+        word_embeddings=word_emb,
+        position_embeddings=pos_emb,
+        LayerNorm=layer_norm,
+        dropout=dropout,
+        padding_idx=1,
+        create_position_ids_from_input_ids=lambda ids, pad, past: torch.arange(
+            past + 2, past + 2 + ids.shape[1]
+        ).unsqueeze(0),
+    )
+
+    result = _gather_free_forward(self, input_ids=input_ids)
+    torch.testing.assert_close(result, expected)
+
+
+def test_patch_xlm_roberta_gather_replaces_child_module():
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.roberta.modeling_roberta import RobertaConfig, RobertaEmbeddings
+
+    from spyre_inference.transformers_backend import _gather_free_forward, _patch_xlm_roberta_gather
+
+    cfg = RobertaConfig(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = RobertaEmbeddings(cfg)
+
+    model = FakeModel()
+    assert type(model.embeddings) is RobertaEmbeddings
+
+    _patch_xlm_roberta_gather(model)
+
+    # child was swapped to a subclass
+    assert type(model.embeddings) is not RobertaEmbeddings
+    assert isinstance(model.embeddings, RobertaEmbeddings)
+    # the new forward is our gather-free one (compare underlying function)
+    assert model.embeddings.forward.__func__ is _gather_free_forward
+    # weights are preserved
+    assert model.embeddings.word_embeddings.weight.shape == (100, 16)
