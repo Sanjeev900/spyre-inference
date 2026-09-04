@@ -29,7 +29,7 @@ from __future__ import annotations
 import functools
 import sys
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -196,7 +196,7 @@ def _stamp_layer_idx(model: nn.Module) -> None:
 
 
 def _gather_free_forward(
-    self: nn.Module,
+    self: Any,
     input_ids=None,
     token_type_ids=None,
     position_ids=None,
@@ -247,29 +247,31 @@ def _patch_xlm_roberta_gather(model: nn.Module) -> None:
     The replacement is done by swapping the child module on the parent (standard PyTorch
     pattern) rather than mutating ``__class__`` in-place.
     """
+    _RobertaEmbeddings: type | None = None
+    _RobertaEmbeddingsSpyre: type | None = None
     try:
         from transformers.models.roberta.modeling_roberta import (
             RobertaEmbeddings as _RobertaEmbeddings,
         )
 
         class _RobertaEmbeddingsSpyre(_RobertaEmbeddings):
-            forward = _gather_free_forward  # type: ignore[assignment]
+            forward = _gather_free_forward
 
     except ImportError:
-        _RobertaEmbeddings = None
-        _RobertaEmbeddingsSpyre = None  # type: ignore[assignment]
+        pass
 
+    _XLMRobertaEmbeddings: type | None = None
+    _XLMRobertaEmbeddingsSpyre: type | None = None
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings as _XLMRobertaEmbeddings,
         )
 
         class _XLMRobertaEmbeddingsSpyre(_XLMRobertaEmbeddings):
-            forward = _gather_free_forward  # type: ignore[assignment]
+            forward = _gather_free_forward
 
     except ImportError:
-        _XLMRobertaEmbeddings = None
-        _XLMRobertaEmbeddingsSpyre = None  # type: ignore[assignment]
+        pass
 
     replacements: list[tuple[type, type]] = []
     if _RobertaEmbeddings is not None:
