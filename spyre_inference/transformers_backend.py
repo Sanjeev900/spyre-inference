@@ -474,17 +474,23 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
                 setattr(self, name, module)
                 self.init_parameters(module)
 
-        # SequenceClassificationMixin builds self.pooler with classifier=self.classifier
-        # before this __init__ runs. ClassifierPoolerHead stores that reference directly,
-        # so rebinding self.classifier afterwards alone would not update the pooler.
-        # We must update both self.classifier and the pooler's head reference.
+    def _install_head(self) -> None:
+        """Replace self.classifier with a head that runs pre_classifier if present.
+
+        Called from load_weights after checkpoint weights are loaded.
+        self.classifier must still name the original nn.Linear at load time so the
+        weight loader can map 'classifier.*' weights onto it.  We swap it here,
+        after loading, and update the pooler's stored reference at the same time.
+        """
+        # SequenceClassificationMixin builds self.pooler with classifier=self.classifier.
+        # ClassifierPoolerHead stores that reference directly, so rebinding
+        # self.classifier alone does not update the pooler — both must be updated.
         #
         # vLLM's Base.forward calls self.model (the backbone), not
         # ForSequenceClassification.forward. For DistilBERT that means
         # pre_classifier → ReLU → classifier is never invoked automatically.
-        # We wire it in via _PreClassifierHead. ClassifierWithReshape (added by the
-        # mixin) also produces a spurious [B,1,num_labels] output for plain nn.Linear
-        # classifiers; both wrappers squeeze it back to [B,num_labels].
+        # _PreClassifierHead wires it in. ClassifierWithReshape (added by the mixin)
+        # produces a spurious [B,1,num_labels] shape; both heads squeeze it back.
         pre_classifier = getattr(self, "pre_classifier", None)
         if pre_classifier is not None and isinstance(pre_classifier, nn.Linear):
             original_classifier = self.classifier
@@ -516,15 +522,17 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         if classify_pooler is not None:
             classify_pooler.head.classifier = new_head
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        # Install the head wrapper after weights are loaded so that the weight
+        # loader can resolve 'classifier.*' against the original nn.Linear.
+        self._install_head()
+        hf_model = self.model.model if hasattr(self.model, "model") else self.model
+        _apply_spyre_encoder_patches(hf_model)
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
-        hf_model = self.model.model if hasattr(self.model, "model") else self.model
-        _apply_spyre_encoder_patches(hf_model)
         return result
 
 

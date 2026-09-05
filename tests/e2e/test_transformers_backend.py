@@ -535,8 +535,8 @@ def test_patch_xlm_roberta_gather_binds_method():
 def test_pre_classifier_head_wired_into_pooler():
     """_PreClassifierHead is registered on self.classifier AND on the pooler head.
 
-    SpyreTransformersForSequenceClassification.__init__ builds a _PreClassifierHead
-    that chains pre_classifier → ReLU → original_classifier. It then rebinds both
+    SpyreTransformersForSequenceClassification._install_head builds a _PreClassifierHead
+    that chains pre_classifier → ReLU → original_classifier. It rebinds both
     self.classifier and classify_pooler.head.classifier so calls through the pooler
     use the new head.  This test verifies both wiring points and that the squeeze
     of a spurious [B,1,C] output is applied.
@@ -564,8 +564,7 @@ def test_pre_classifier_head_wired_into_pooler():
     classify_pooler = _FakeClassifyPooler(original_clf)
     pooler = types.SimpleNamespace(poolers_by_task={"classify": classify_pooler})
 
-    # Replicate the logic from SpyreTransformersForSequenceClassification.__init__
-    # that builds and wires the new head.
+    # Replicate the logic from SpyreTransformersForSequenceClassification._install_head.
     pre_classifier = pre_clf
 
     class _PreClassifierHead(nn.Module):
@@ -579,7 +578,7 @@ def test_pre_classifier_head_wired_into_pooler():
 
     new_head = _PreClassifierHead()
 
-    # Simulate the two binding lines in __init__
+    # Simulate the two binding lines in _install_head.
     classifier = new_head
     cp = pooler.poolers_by_task.get("classify")
     if cp is not None:
