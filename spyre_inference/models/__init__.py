@@ -48,9 +48,16 @@ SPYRE_MODELS: dict[str, str] = {
     # Decoders. Gemma4ForConditionalGeneration needs no entry of its own: it
     # builds its language model through the registry, so it picks this one up.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
-    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
+    # Transformers backend: override with Spyre subclasses (RoPE cache,
+    # gather-free embeddings, pre_classifier inference path, etc.).
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
+    ),
+    "TransformersEmbeddingModel": (
+        "spyre_inference.transformers_backend:SpyreTransformersEmbeddingModel"
+    ),
+    "TransformersForSequenceClassification": (
+        "spyre_inference.transformers_backend:SpyreTransformersForSequenceClassification"
     ),
 }
 

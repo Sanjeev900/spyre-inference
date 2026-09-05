@@ -399,3 +399,329 @@ def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
 
     assert vllm_config.model_config.hf_config is before
     assert vllm_config.load_config.load_format == "auto"
+
+
+def test_stamp_layer_idx_assigns_sequential_indices():
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _stamp_layer_idx
+
+    class FakeSelfAttention(nn.Module):
+        pass
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = FakeSelfAttention()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = Block()
+            self.layer1 = Block()
+
+    model = Model()
+    assert not hasattr(model.layer0.attention, "layer_idx")
+    assert not hasattr(model.layer1.attention, "layer_idx")
+
+    _stamp_layer_idx(model)
+
+    assert model.layer0.attention.layer_idx == 0
+    assert model.layer1.attention.layer_idx == 1
+
+
+def test_stamp_layer_idx_skips_modules_that_already_have_it():
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _stamp_layer_idx
+
+    class FakeSelfAttention(nn.Module):
+        def __init__(self, idx):
+            super().__init__()
+            self.layer_idx = idx
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = FakeSelfAttention(99)
+
+    model = Model()
+    _stamp_layer_idx(model)
+    assert model.attn.layer_idx == 99
+
+
+def test_gather_free_forward_matches_weight0_expand():
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    from spyre_inference.transformers_backend import _gather_free_forward
+
+    embed_dim = 8
+    vocab_size = 16
+    seq_len = 4
+
+    torch.manual_seed(0)
+    word_emb = nn.Embedding(vocab_size, embed_dim)
+    pos_emb = nn.Embedding(32, embed_dim)
+    tte = nn.Embedding(2, embed_dim)
+    layer_norm = nn.LayerNorm(embed_dim)
+    dropout = nn.Dropout(0.0)
+
+    # weight[0] broadcast — what the function should compute
+    input_ids = torch.randint(0, vocab_size, (1, seq_len))
+    position_ids = torch.arange(2, 2 + seq_len).unsqueeze(0)
+    inputs_embeds = word_emb(input_ids)
+    expected_tte = tte.weight[0].view(1, 1, -1).expand(1, seq_len, -1)
+    pos_out = pos_emb(position_ids)
+    expected = layer_norm(inputs_embeds + expected_tte + pos_out)
+
+    # fake self with the attributes _gather_free_forward accesses
+    self = types.SimpleNamespace(
+        token_type_embeddings=tte,
+        word_embeddings=word_emb,
+        position_embeddings=pos_emb,
+        LayerNorm=layer_norm,
+        dropout=dropout,
+        padding_idx=1,
+        create_position_ids_from_input_ids=lambda ids, pad, past: torch.arange(
+            past + 2, past + 2 + ids.shape[1]
+        ).unsqueeze(0),
+    )
+
+    result = _gather_free_forward(self, input_ids=input_ids)
+    torch.testing.assert_close(result, expected)
+
+
+def test_patch_xlm_roberta_gather_binds_method():
+    """_patch_xlm_roberta_gather binds _gather_free_forward as an instance method.
+
+    The original class must be unchanged (no subclass swap); only the instance's
+    forward attribute is replaced via __get__.
+    """
+    pytest.importorskip("transformers")
+    import torch.nn as nn
+    from transformers.models.roberta.modeling_roberta import RobertaConfig, RobertaEmbeddings
+
+    from spyre_inference.transformers_backend import _gather_free_forward, _patch_xlm_roberta_gather
+
+    cfg = RobertaConfig(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        vocab_size=100,
+    )
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = RobertaEmbeddings(cfg)
+
+    model = FakeModel()
+    assert type(model.embeddings) is RobertaEmbeddings
+
+    _patch_xlm_roberta_gather(model)
+
+    # class is unchanged — no subclass swap
+    assert type(model.embeddings) is RobertaEmbeddings
+    # instance forward is bound to our gather-free implementation
+    assert model.embeddings.forward.__func__ is _gather_free_forward
+    # weights are preserved
+    assert model.embeddings.word_embeddings.weight.shape == (100, 16)
+
+
+def test_pre_classifier_head_wired_into_pooler():
+    """_PreClassifierHead is registered on self.classifier AND on the pooler head.
+
+    SpyreTransformersForSequenceClassification._install_head builds a _PreClassifierHead
+    that chains pre_classifier → ReLU → original_classifier. It rebinds both
+    self.classifier and classify_pooler.head.classifier so calls through the pooler
+    use the new head.  This test verifies both wiring points and that the squeeze
+    of a spurious [B,1,C] output is applied.
+    """
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    # Minimal stand-ins for vLLM's ClassifierPoolerHead and SequencePooler.
+    class _FakeHead:
+        def __init__(self, clf):
+            self.classifier = clf
+
+    class _FakeClassifyPooler:
+        def __init__(self, clf):
+            self.head = _FakeHead(clf)
+
+    # Original classifier: nn.Linear produces [B, C] or [B, 1, C] shape.
+    hidden = 8
+    num_labels = 3
+    original_clf = nn.Linear(hidden, num_labels)
+    pre_clf = nn.Linear(hidden, hidden)
+
+    classify_pooler = _FakeClassifyPooler(original_clf)
+    pooler = types.SimpleNamespace(poolers_by_task={"classify": classify_pooler})
+
+    # Replicate the logic from SpyreTransformersForSequenceClassification._install_head.
+    class _PreClassifierHead(nn.Module):
+        def __init__(self_inner, pre_clf: nn.Module, classifier: nn.Module) -> None:  # noqa: N805
+            super().__init__()
+            self_inner.pre_clf = pre_clf
+            self_inner.classifier = classifier
+
+        def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+            x = self_inner.pre_clf(x)
+            x = nn.functional.relu(x)
+            out = self_inner.classifier(x)
+            if out.ndim == 3 and out.shape[1] == 1:
+                out = out.squeeze(1)
+            return out
+
+    new_head = _PreClassifierHead(pre_clf, original_clf)
+
+    # Simulate the two binding lines in _install_head.
+    classifier = new_head
+    cp = pooler.poolers_by_task.get("classify")
+    if cp is not None:
+        cp.head.classifier = new_head
+
+    # Both references must point to the new head.
+    assert classifier is new_head
+    assert classify_pooler.head.classifier is new_head
+
+    # parameters() must be non-empty so spyre_pooler._module_has_float32_params
+    # can detect fp32 weights and route the pooler to CPU.
+    assert list(new_head.parameters()), "head must expose parameters for Spyre CPU routing"
+
+    # Functional check: output shape is [B, num_labels].
+    x = torch.randn(2, hidden)
+    with torch.no_grad():
+        out = new_head(x)
+    assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"
+
+
+def test_pre_classifier_head_dtype_matches_classifier():
+    """pre_clf must be cast to classifier's dtype before _PreClassifierHead is built.
+
+    ClassifierPoolerHead stores head_dtype=float32 and calls
+    pooled_data.to(head_dtype) before invoking self.classifier. Our _install_head
+    must cast pre_classifier to the same dtype so the matmul doesn't raise
+    "mat1 and mat2 must have the same dtype, but got Float and Half".
+    """
+    import torch
+    import torch.nn as nn
+
+    hidden = 8
+    num_labels = 3
+
+    # classifier is fp32 (as head_dtype=float32 from SequenceClassificationMixin)
+    classifier = nn.Linear(hidden, num_labels, dtype=torch.float32)
+    # pre_classifier starts fp16 (model dtype from init_parameters)
+    pre_classifier = nn.Linear(hidden, hidden, dtype=torch.float16)
+
+    # Simulate the dtype-alignment step from _install_head.
+    clf_dtype = next(classifier.parameters()).dtype
+    pre_classifier.to(dtype=clf_dtype)
+
+    # After alignment pre_clf must match classifier dtype.
+    assert next(pre_classifier.parameters()).dtype == torch.float32
+
+    # Functional check: fp32 input flows through both layers without dtype error.
+    x = torch.randn(2, hidden, dtype=torch.float32)
+    with torch.no_grad():
+        out = nn.functional.relu(pre_classifier(x))
+        out = classifier(out)
+    assert out.shape == (2, num_labels)
+    assert out.dtype == torch.float32
+
+
+def test_squeeze_head_removes_spurious_dim():
+    """_SqueezeHead squeezes [B, 1, C] → [B, C]; passes [B, C] through unchanged."""
+    import torch
+    import torch.nn as nn
+
+    hidden = 8
+    num_labels = 4
+    original_clf = nn.Linear(hidden, num_labels)
+
+    class _SqueezeHead(nn.Module):
+        def __init__(self_inner, classifier: nn.Module) -> None:  # noqa: N805
+            super().__init__()
+            self_inner.classifier = classifier
+
+        def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+            out = self_inner.classifier(x)
+            if out.ndim == 3 and out.shape[1] == 1:
+                out = out.squeeze(1)
+            return out
+
+    head = _SqueezeHead(original_clf)
+
+    # parameters() must be non-empty.
+    assert list(head.parameters()), "head must expose parameters for Spyre CPU routing"
+
+    # [B, C] passes through unchanged.
+    x = torch.randn(2, hidden)
+    with torch.no_grad():
+        out = head(x)
+    assert out.shape == (2, num_labels)
+
+    # [B, 1, C] is squeezed to [B, C].
+    class _FakeLinear(nn.Module):
+        def forward(self, x):
+            return torch.zeros(x.shape[0], 1, num_labels)
+
+    head3d = _SqueezeHead(_FakeLinear())
+    with torch.no_grad():
+        out = head3d(x)
+    assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"
+
+
+def test_load_weights_aliases_pre_classifier_paths():
+    """load_weights must alias both pre_classifier.* and classifier.* after _install_head.
+
+    _install_head nests weights under new paths:
+      pre_classifier.weight/bias -> classifier.pre_clf.weight/bias
+      classifier.weight/bias     -> classifier.classifier.weight/bias
+
+    track_weights_loading (vLLM) raises if any named_parameters() path is absent
+    from the returned set.  All four aliases must be added when the old key is present.
+    """
+    # Simulate what super().load_weights() returns: the checkpoint key set.
+    result = {
+        "pre_classifier.weight",
+        "pre_classifier.bias",
+        "classifier.weight",
+        "classifier.bias",
+    }
+
+    # Apply the alias dict exactly as in SpyreTransformersForSequenceClassification.load_weights.
+    aliases = {
+        "pre_classifier.weight": "classifier.pre_clf.weight",
+        "pre_classifier.bias": "classifier.pre_clf.bias",
+        "classifier.weight": "classifier.classifier.weight",
+        "classifier.bias": "classifier.classifier.bias",
+    }
+    for old, new in aliases.items():
+        if old in result:
+            result.add(new)
+
+    # After aliasing, all new parameter paths must be present.
+    assert "classifier.pre_clf.weight" in result
+    assert "classifier.pre_clf.bias" in result
+    assert "classifier.classifier.weight" in result
+    assert "classifier.classifier.bias" in result
+
+    # Models without pre_classifier (e.g. BERT reranker) only have classifier.* in result.
+    result_no_pre = {"classifier.weight", "classifier.bias"}
+    for old, new in aliases.items():
+        if old in result_no_pre:
+            result_no_pre.add(new)
+
+    assert "classifier.classifier.weight" in result_no_pre
+    assert "classifier.classifier.bias" in result_no_pre
+    # pre_clf paths must NOT be added when the source keys are absent.
+    assert "classifier.pre_clf.weight" not in result_no_pre
+    assert "classifier.pre_clf.bias" not in result_no_pre

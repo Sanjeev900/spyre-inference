@@ -29,14 +29,18 @@ from __future__ import annotations
 import functools
 import sys
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+    TransformersForSequenceClassification,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -175,6 +179,125 @@ def _rope_dispatch(original: Callable) -> Callable:
     return apply_rotary_pos_emb
 
 
+def _stamp_layer_idx(model: nn.Module) -> None:
+    """Stamp ``layer_idx`` on every ``*SelfAttention`` module that lacks it.
+
+    vLLM's ``vllm_attention_forward`` looks up the attention instance by
+    ``module.layer_idx``. Models like DistilBERT route through
+    ``ALL_ATTENTION_FUNCTIONS`` but never set ``layer_idx`` on their
+    ``SelfAttention`` — unlike BERT/RoBERTa which accept it as a constructor arg.
+    Walk the model in ``modules()`` traversal order (which matches
+    ``create_attention_instances``' 0..N-1 ordering) and assign sequential indices
+    to any attention module missing the attribute.
+    """
+    idx = 0
+    for module in model.modules():
+        if type(module).__name__.endswith("SelfAttention") and not hasattr(module, "layer_idx"):
+            module.layer_idx = idx
+            idx += 1
+
+
+def _gather_free_forward(
+    self: Any,
+    input_ids=None,
+    token_type_ids=None,
+    position_ids=None,
+    inputs_embeds=None,
+    past_key_values_length=0,
+):
+    """Forward for RoBERTa/XLM-RoBERTa embeddings that avoids integer indexing.
+
+    HF's ``RobertaEmbeddings``/``XLMRobertaEmbeddings`` has two branches for
+    ``token_type_ids``:
+
+    * buffer present → ``torch.gather`` on int64 position IDs
+      (not supported on the Spyre layout remapper; torch-spyre issue TBD)
+    * buffer absent  → ``torch.zeros(..., dtype=torch.long)``
+      (int64→int32 downcast triggers a ``ReStickifyOpHBM`` crash in the Spyre
+      inductor codegen; torch-spyre issue TBD)
+
+    RoBERTa and XLM-RoBERTa have ``type_vocab_size=2`` but only ever use token
+    type 0 — vLLM's Transformers backend never passes ``token_type_ids``, so the
+    result is always ``weight[0]`` broadcast. This forward computes that directly,
+    keeping the graph float-only.
+
+    **Do not apply to BERT-style pair inputs** (NSP / sentence-pair tasks) where
+    ``token_type_ids`` carry meaningful segment information.
+    ``_patch_xlm_roberta_gather`` only installs this on
+    ``RobertaEmbeddings`` / ``XLMRobertaEmbeddings`` modules, which are
+    single-type by design.
+    """
+    if input_ids is not None:
+        batch_size, seq_length = input_ids.shape
+    else:
+        assert inputs_embeds is not None
+        batch_size, seq_length = inputs_embeds.shape[:2]
+    token_type_embeddings = (
+        self.token_type_embeddings.weight[0].view(1, 1, -1).expand(batch_size, seq_length, -1)
+    )
+    if position_ids is None:
+        if input_ids is not None:
+            position_ids = self.create_position_ids_from_input_ids(
+                input_ids, self.padding_idx, past_key_values_length
+            )
+        else:
+            position_ids = self.create_position_ids_from_inputs_embeds(
+                inputs_embeds, self.padding_idx
+            )
+    if inputs_embeds is None:
+        inputs_embeds = self.word_embeddings(input_ids)
+    embeddings = inputs_embeds + token_type_embeddings
+    embeddings = embeddings + self.position_embeddings(position_ids)
+    embeddings = self.LayerNorm(embeddings)
+    return self.dropout(embeddings)
+
+
+def _patch_xlm_roberta_gather(model: nn.Module) -> None:
+    """Bind ``_gather_free_forward`` onto any ``RobertaEmbeddings`` /
+    ``XLMRobertaEmbeddings`` instance found in *model*.
+
+    Uses instance-level method binding (``forward.__get__``) so the original
+    class is not mutated and no module swap is required.
+    """
+    target_classes: list[type] = []
+    try:
+        from transformers.models.roberta.modeling_roberta import (
+            RobertaEmbeddings as _RobertaEmbeddings,
+        )
+
+        target_classes.append(_RobertaEmbeddings)
+    except ImportError:
+        pass
+    try:
+        from transformers.models.xlm_roberta.modeling_xlm_roberta import (
+            XLMRobertaEmbeddings as _XLMRobertaEmbeddings,
+        )
+
+        target_classes.append(_XLMRobertaEmbeddings)
+    except ImportError:
+        pass
+    if not target_classes:
+        return
+
+    for name, module in model.named_modules():
+        if type(module) in target_classes:
+            module.forward = _gather_free_forward.__get__(module, type(module))
+            logger.debug("patched %s with gather-free forward", name or "model")
+
+
+def _apply_spyre_encoder_patches(model: nn.Module) -> None:
+    """Apply all Spyre encoder-model patches after weights are loaded.
+
+    Called from ``load_weights`` in both encoder backend classes.  Each
+    sub-patch guards itself: ``_stamp_layer_idx`` skips modules that already
+    carry ``layer_idx``; ``_patch_xlm_roberta_gather`` only fires when
+    ``RobertaEmbeddings`` / ``XLMRobertaEmbeddings`` is present.  Both are
+    no-ops on models that do not need them.
+    """
+    _stamp_layer_idx(model)
+    _patch_xlm_roberta_gather(model)
+
+
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
     """Rebuild *rope* at the pre-pad head_dim.
 
@@ -304,3 +427,147 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
 # against "TransformersForCausalLM", so the subclass has to keep answering to that name.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
+
+
+class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
+    """Transformers backend for encoder pooling models on Spyre."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        logger.debug("SpyreTransformersEmbeddingModel ready: %s", type(self.model).__name__)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        hf_model = self.model.model if hasattr(self.model, "model") else self.model
+        _apply_spyre_encoder_patches(hf_model)
+        return result
+
+
+# Same aliasing requirement as SpyreTransformersForCausalLM.
+SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
+
+
+class SpyreTransformersForSequenceClassification(TransformersForSequenceClassification):
+    """Transformers backend for pooling/classify (reranker) models on Spyre."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        from transformers import AutoModelForSequenceClassification
+
+        SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # SequenceClassificationMixin only extracts `classifier` (or `score`) from the
+        # ForSequenceClassification model. Models like DistilBERT have an additional
+        # head layer (pre_classifier) with checkpoint weights that must be registered so
+        # the weight loader can place them. Only register modules that actually have
+        # parameters — parameter-free modules like nn.Dropout have no checkpoint weights.
+        with torch.device("meta"):
+            seq_cls_model = AutoModelForSequenceClassification.from_config(
+                self.model.config,
+                dtype=self.model_config.dtype,
+                trust_remote_code=self.model_config.trust_remote_code,
+            )
+        for name in ("pre_classifier",):
+            module = getattr(seq_cls_model, name, None)
+            if module is not None and not hasattr(self, name) and list(module.parameters()):
+                setattr(self, name, module)
+                self.init_parameters(module)
+
+    def _install_head(self) -> None:
+        """Replace self.classifier with a head that runs pre_classifier if present.
+
+        Called from load_weights after checkpoint weights are loaded.
+        self.classifier must still name the original nn.Linear at load time so the
+        weight loader can map 'classifier.*' weights onto it.  We swap it here,
+        after loading, and update the pooler's stored reference at the same time.
+        """
+        # SequenceClassificationMixin builds self.pooler with classifier=self.classifier.
+        # ClassifierPoolerHead stores that reference directly, so rebinding
+        # self.classifier alone does not update the pooler — both must be updated.
+        #
+        # vLLM's Base.forward calls self.model (the backbone), not
+        # ForSequenceClassification.forward. For DistilBERT that means
+        # pre_classifier → ReLU → classifier is never invoked automatically.
+        # _PreClassifierHead wires it in. ClassifierWithReshape (added by the mixin)
+        # produces a spurious [B,1,num_labels] shape; both heads squeeze it back.
+        pre_classifier = getattr(self, "pre_classifier", None)
+        if pre_classifier is not None and isinstance(pre_classifier, nn.Linear):
+            # self.classifier was materialised at head_dtype (float32 by default for
+            # pooling models) by SequenceClassificationMixin.init_parameters.
+            # ClassifierPoolerHead casts pooled_data to head_dtype before calling
+            # self.classifier, so pre_clf must be at the same dtype. Read the dtype
+            # from self.classifier rather than hardcoding float32 so this stays
+            # correct if head_dtype changes in the future.
+            clf_dtype = next(self.classifier.parameters()).dtype
+            pre_classifier = pre_classifier.to(dtype=clf_dtype)
+
+            class _PreClassifierHead(nn.Module):
+                def __init__(self_inner, pre_clf: nn.Module, classifier: nn.Module) -> None:  # noqa: N805
+                    super().__init__()
+                    self_inner.pre_clf = pre_clf
+                    # Named 'classifier' so spyre_pooler's getattr(model, 'classifier')
+                    # and _module_has_float32_params recurse into it correctly.
+                    self_inner.classifier = classifier
+
+                def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+                    x = self_inner.pre_clf(x)
+                    x = nn.functional.relu(x)
+                    out = self_inner.classifier(x)
+                    if out.ndim == 3 and out.shape[1] == 1:
+                        out = out.squeeze(1)
+                    return out
+
+            new_head = _PreClassifierHead(pre_classifier, self.classifier)
+        else:
+
+            class _SqueezeHead(nn.Module):
+                def __init__(self_inner, classifier: nn.Module) -> None:  # noqa: N805
+                    super().__init__()
+                    self_inner.classifier = classifier
+
+                def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+                    out = self_inner.classifier(x)
+                    if out.ndim == 3 and out.shape[1] == 1:
+                        out = out.squeeze(1)
+                    return out
+
+            new_head = _SqueezeHead(self.classifier)
+
+        self.classifier = new_head
+        classify_pooler = self.pooler.poolers_by_task.get("classify")
+        if classify_pooler is not None:
+            classify_pooler.head.classifier = new_head
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        # Install the head wrapper after weights are loaded so that the weight
+        # loader can resolve 'classifier.*' against the original nn.Linear.
+        self._install_head()
+        # track_weights_loading audits model.named_parameters() against the
+        # returned set after this method returns. _install_head renames parameter
+        # paths in two ways:
+        #   pre_classifier.* -> classifier.pre_clf.*   (_PreClassifierHead path)
+        #   classifier.*     -> classifier.classifier.*  (both head variants)
+        # The underlying Parameter objects are identical; map all four old checkpoint
+        # names to their new paths explicitly.
+        aliases = {
+            "pre_classifier.weight": "classifier.pre_clf.weight",
+            "pre_classifier.bias": "classifier.pre_clf.bias",
+            "classifier.weight": "classifier.classifier.weight",
+            "classifier.bias": "classifier.classifier.bias",
+        }
+        for old, new in aliases.items():
+            if old in result:
+                result.add(new)
+        hf_model = self.model.model if hasattr(self.model, "model") else self.model
+        _apply_spyre_encoder_patches(hf_model)
+        logger.debug(
+            "SpyreTransformersForSequenceClassification ready: %s",
+            type(self.model).__name__,
+        )
+        return result
+
+
+# Same aliasing requirement as SpyreTransformersForCausalLM.
+SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"
