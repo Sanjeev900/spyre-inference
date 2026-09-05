@@ -565,18 +565,21 @@ def test_pre_classifier_head_wired_into_pooler():
     pooler = types.SimpleNamespace(poolers_by_task={"classify": classify_pooler})
 
     # Replicate the logic from SpyreTransformersForSequenceClassification._install_head.
-    pre_classifier = pre_clf
-
     class _PreClassifierHead(nn.Module):
+        def __init__(self_inner, pre_clf: nn.Module, classifier: nn.Module) -> None:  # noqa: N805
+            super().__init__()
+            self_inner.pre_clf = pre_clf
+            self_inner.classifier = classifier
+
         def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
-            x = pre_classifier(x)
+            x = self_inner.pre_clf(x)
             x = nn.functional.relu(x)
-            out = original_clf(x)
+            out = self_inner.classifier(x)
             if out.ndim == 3 and out.shape[1] == 1:
                 out = out.squeeze(1)
             return out
 
-    new_head = _PreClassifierHead()
+    new_head = _PreClassifierHead(pre_clf, original_clf)
 
     # Simulate the two binding lines in _install_head.
     classifier = new_head
@@ -588,7 +591,11 @@ def test_pre_classifier_head_wired_into_pooler():
     assert classifier is new_head
     assert classify_pooler.head.classifier is new_head
 
-    # Functional check: [B, 1, C] is squeezed to [B, C].
+    # parameters() must be non-empty so spyre_pooler._module_has_float32_params
+    # can detect fp32 weights and route the pooler to CPU.
+    assert list(new_head.parameters()), "head must expose parameters for Spyre CPU routing"
+
+    # Functional check: output shape is [B, num_labels].
     x = torch.randn(2, hidden)
     with torch.no_grad():
         out = new_head(x)
@@ -604,39 +611,34 @@ def test_squeeze_head_removes_spurious_dim():
     num_labels = 4
     original_clf = nn.Linear(hidden, num_labels)
 
-    # Replicate _SqueezeHead
     class _SqueezeHead(nn.Module):
+        def __init__(self_inner, classifier: nn.Module) -> None:  # noqa: N805
+            super().__init__()
+            self_inner.classifier = classifier
+
         def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
-            out = original_clf(x)
+            out = self_inner.classifier(x)
             if out.ndim == 3 and out.shape[1] == 1:
                 out = out.squeeze(1)
             return out
 
-    head = _SqueezeHead()
+    head = _SqueezeHead(original_clf)
 
-    # When the classifier output is [B, C] (already correct shape).
+    # parameters() must be non-empty.
+    assert list(head.parameters()), "head must expose parameters for Spyre CPU routing"
+
+    # [B, C] passes through unchanged.
     x = torch.randn(2, hidden)
     with torch.no_grad():
         out = head(x)
     assert out.shape == (2, num_labels)
 
-    # When the input already has a batch × seq × hidden shape (simulates
-    # ClassifierWithReshape wrapping a plain nn.Linear).
-    # We manually inject a 3-D output by patching original_clf.
+    # [B, 1, C] is squeezed to [B, C].
     class _FakeLinear(nn.Module):
         def forward(self, x):
             return torch.zeros(x.shape[0], 1, num_labels)
 
-    original_clf_3d = _FakeLinear()
-
-    class _SqueezeHead3D(nn.Module):
-        def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
-            out = original_clf_3d(x)
-            if out.ndim == 3 and out.shape[1] == 1:
-                out = out.squeeze(1)
-            return out
-
-    head3d = _SqueezeHead3D()
+    head3d = _SqueezeHead(_FakeLinear())
     with torch.no_grad():
         out = head3d(x)
     assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"

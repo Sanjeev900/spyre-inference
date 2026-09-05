@@ -493,29 +493,38 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         # produces a spurious [B,1,num_labels] shape; both heads squeeze it back.
         pre_classifier = getattr(self, "pre_classifier", None)
         if pre_classifier is not None and isinstance(pre_classifier, nn.Linear):
-            original_classifier = self.classifier
 
             class _PreClassifierHead(nn.Module):
+                def __init__(self_inner, pre_clf: nn.Module, classifier: nn.Module) -> None:  # noqa: N805
+                    super().__init__()
+                    self_inner.pre_clf = pre_clf
+                    # Named 'classifier' so spyre_pooler's getattr(model, 'classifier')
+                    # and _module_has_float32_params recurse into it correctly.
+                    self_inner.classifier = classifier
+
                 def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
-                    x = pre_classifier(x)
+                    x = self_inner.pre_clf(x)
                     x = nn.functional.relu(x)
-                    out = original_classifier(x)
+                    out = self_inner.classifier(x)
                     if out.ndim == 3 and out.shape[1] == 1:
                         out = out.squeeze(1)
                     return out
 
-            new_head = _PreClassifierHead()
+            new_head = _PreClassifierHead(pre_classifier, self.classifier)
         else:
-            original_classifier = self.classifier
 
             class _SqueezeHead(nn.Module):
+                def __init__(self_inner, classifier: nn.Module) -> None:  # noqa: N805
+                    super().__init__()
+                    self_inner.classifier = classifier
+
                 def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
-                    out = original_classifier(x)
+                    out = self_inner.classifier(x)
                     if out.ndim == 3 and out.shape[1] == 1:
                         out = out.squeeze(1)
                     return out
 
-            new_head = _SqueezeHead()
+            new_head = _SqueezeHead(self.classifier)
 
         self.classifier = new_head
         classify_pooler = self.pooler.poolers_by_task.get("classify")
