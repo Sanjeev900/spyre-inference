@@ -52,6 +52,7 @@ LAST_POOLING_PROMPTS = [
 ]
 
 # Sequence classifiers via model_impl='transformers' (TransformersForSequenceClassification).
+# id2label for distilbert-base-uncased-finetuned-sst-2-english: {0: NEGATIVE, 1: POSITIVE}
 CLASSIFY_MODELS = [
     "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
 ]
@@ -60,6 +61,10 @@ CLASSIFY_PROMPTS = [
     "This movie is great!",
     "This movie is terrible!",
 ]
+
+# HF fp32 reference (cpu): great→POSITIVE≈0.9999, terrible→NEGATIVE≈0.9997.
+# Minimum probability for the correct class to catch near-uniform wrong results.
+CLASSIFY_MIN_CORRECT_PROB = 0.9
 
 # Cross-encoder reranker smoke (classify / score path). One model is enough —
 # both BGE variants share XLMRobertaForSequenceClassification.
@@ -234,7 +239,12 @@ def test_encoder_rerank_models(model: str) -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", CLASSIFY_MODELS)
 def test_encoder_classify_models(model: str) -> None:
-    """TransformersForSequenceClassification: probabilities are valid and sum to 1."""
+    """TransformersForSequenceClassification: valid probs, sum to 1, and correct sentiment.
+
+    Checks the correct label scores a high probability so that a broken head
+    (e.g. missing pre_classifier producing near-uniform [0.51, 0.49]) fails.
+    Expected labels for distilbert-sst2: {0: NEGATIVE, 1: POSITIVE}.
+    """
     llm = LLM(
         model=model,
         runner="pooling",
@@ -249,6 +259,19 @@ def test_encoder_classify_models(model: str) -> None:
         assert len(probs) > 0
         assert all(math.isfinite(p) for p in probs)
         assert abs(sum(probs) - 1.0) < 1e-3
+
+    # distilbert-sst2: label 0=NEGATIVE, 1=POSITIVE.
+    # "great" must be strongly POSITIVE; "terrible" must be strongly NEGATIVE.
+    great_probs = outputs[0].outputs.probs
+    terrible_probs = outputs[1].outputs.probs
+    assert great_probs[1] >= CLASSIFY_MIN_CORRECT_PROB, (
+        f"'great' POSITIVE={great_probs[1]:.4f} < {CLASSIFY_MIN_CORRECT_PROB} "
+        f"(near-uniform result suggests broken head)"
+    )
+    assert terrible_probs[0] >= CLASSIFY_MIN_CORRECT_PROB, (
+        f"'terrible' NEGATIVE={terrible_probs[0]:.4f} < {CLASSIFY_MIN_CORRECT_PROB} "
+        f"(near-uniform result suggests broken head)"
+    )
 
 
 @pytest.mark.uses_subprocess

@@ -602,6 +602,41 @@ def test_pre_classifier_head_wired_into_pooler():
     assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"
 
 
+def test_pre_classifier_head_dtype_matches_classifier():
+    """pre_clf must be cast to classifier's dtype before _PreClassifierHead is built.
+
+    ClassifierPoolerHead stores head_dtype=float32 and calls
+    pooled_data.to(head_dtype) before invoking self.classifier. Our _install_head
+    must cast pre_classifier to the same dtype so the matmul doesn't raise
+    "mat1 and mat2 must have the same dtype, but got Float and Half".
+    """
+    import torch
+    import torch.nn as nn
+
+    hidden = 8
+    num_labels = 3
+
+    # classifier is fp32 (as head_dtype=float32 from SequenceClassificationMixin)
+    classifier = nn.Linear(hidden, num_labels, dtype=torch.float32)
+    # pre_classifier starts fp16 (model dtype from init_parameters)
+    pre_classifier = nn.Linear(hidden, hidden, dtype=torch.float16)
+
+    # Simulate the dtype-alignment step from _install_head.
+    clf_dtype = next(classifier.parameters()).dtype
+    pre_classifier.to(dtype=clf_dtype)
+
+    # After alignment pre_clf must match classifier dtype.
+    assert next(pre_classifier.parameters()).dtype == torch.float32
+
+    # Functional check: fp32 input flows through both layers without dtype error.
+    x = torch.randn(2, hidden, dtype=torch.float32)
+    with torch.no_grad():
+        out = nn.functional.relu(pre_classifier(x))
+        out = classifier(out)
+    assert out.shape == (2, num_labels)
+    assert out.dtype == torch.float32
+
+
 def test_squeeze_head_removes_spurious_dim():
     """_SqueezeHead squeezes [B, 1, C] → [B, C]; passes [B, C] through unchanged."""
     import torch

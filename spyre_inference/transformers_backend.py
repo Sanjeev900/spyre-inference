@@ -493,6 +493,14 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         # produces a spurious [B,1,num_labels] shape; both heads squeeze it back.
         pre_classifier = getattr(self, "pre_classifier", None)
         if pre_classifier is not None and isinstance(pre_classifier, nn.Linear):
+            # self.classifier was materialised at head_dtype (float32 by default for
+            # pooling models) by SequenceClassificationMixin.init_parameters.
+            # ClassifierPoolerHead casts pooled_data to head_dtype before calling
+            # self.classifier, so pre_clf must be at the same dtype. Read the dtype
+            # from self.classifier rather than hardcoding float32 so this stays
+            # correct if head_dtype changes in the future.
+            clf_dtype = next(self.classifier.parameters()).dtype
+            pre_classifier = pre_classifier.to(dtype=clf_dtype)
 
             class _PreClassifierHead(nn.Module):
                 def __init__(self_inner, pre_clf: nn.Module, classifier: nn.Module) -> None:  # noqa: N805
