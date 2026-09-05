@@ -642,3 +642,51 @@ def test_squeeze_head_removes_spurious_dim():
     with torch.no_grad():
         out = head3d(x)
     assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"
+
+
+def test_load_weights_aliases_pre_classifier_paths():
+    """load_weights must alias both pre_classifier.* and classifier.* after _install_head.
+
+    _install_head nests weights under new paths:
+      pre_classifier.weight/bias -> classifier.pre_clf.weight/bias
+      classifier.weight/bias     -> classifier.classifier.weight/bias
+
+    track_weights_loading (vLLM) raises if any named_parameters() path is absent
+    from the returned set.  All four aliases must be added when the old key is present.
+    """
+    # Simulate what super().load_weights() returns: the checkpoint key set.
+    result = {
+        "pre_classifier.weight",
+        "pre_classifier.bias",
+        "classifier.weight",
+        "classifier.bias",
+    }
+
+    # Apply the alias dict exactly as in SpyreTransformersForSequenceClassification.load_weights.
+    aliases = {
+        "pre_classifier.weight": "classifier.pre_clf.weight",
+        "pre_classifier.bias": "classifier.pre_clf.bias",
+        "classifier.weight": "classifier.classifier.weight",
+        "classifier.bias": "classifier.classifier.bias",
+    }
+    for old, new in aliases.items():
+        if old in result:
+            result.add(new)
+
+    # After aliasing, all new parameter paths must be present.
+    assert "classifier.pre_clf.weight" in result
+    assert "classifier.pre_clf.bias" in result
+    assert "classifier.classifier.weight" in result
+    assert "classifier.classifier.bias" in result
+
+    # Models without pre_classifier (e.g. BERT reranker) only have classifier.* in result.
+    result_no_pre = {"classifier.weight", "classifier.bias"}
+    for old, new in aliases.items():
+        if old in result_no_pre:
+            result_no_pre.add(new)
+
+    assert "classifier.classifier.weight" in result_no_pre
+    assert "classifier.classifier.bias" in result_no_pre
+    # pre_clf paths must NOT be added when the source keys are absent.
+    assert "classifier.pre_clf.weight" not in result_no_pre
+    assert "classifier.pre_clf.bias" not in result_no_pre

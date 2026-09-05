@@ -537,14 +537,19 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         # loader can resolve 'classifier.*' against the original nn.Linear.
         self._install_head()
         # track_weights_loading audits model.named_parameters() against the
-        # returned set after this method returns. _install_head nests the original
-        # classifier nn.Linear under classifier.classifier, so the parameter paths
-        # change from 'classifier.*' to 'classifier.classifier.*'. The underlying
-        # Parameter objects are identical (same Python objects, verified by identity).
-        # Map the old checkpoint names to the new paths explicitly.
-        for suffix in ("weight", "bias"):
-            old = f"classifier.{suffix}"
-            new = f"classifier.classifier.{suffix}"
+        # returned set after this method returns. _install_head renames parameter
+        # paths in two ways:
+        #   pre_classifier.* -> classifier.pre_clf.*   (_PreClassifierHead path)
+        #   classifier.*     -> classifier.classifier.*  (both head variants)
+        # The underlying Parameter objects are identical; map all four old checkpoint
+        # names to their new paths explicitly.
+        aliases = {
+            "pre_classifier.weight": "classifier.pre_clf.weight",
+            "pre_classifier.bias": "classifier.pre_clf.bias",
+            "classifier.weight": "classifier.classifier.weight",
+            "classifier.bias": "classifier.classifier.bias",
+        }
+        for old, new in aliases.items():
             if old in result:
                 result.add(new)
         hf_model = self.model.model if hasattr(self.model, "model") else self.model
