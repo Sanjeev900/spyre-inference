@@ -180,13 +180,15 @@ def _rope_dispatch(original: Callable) -> Callable:
 
 
 def _stamp_layer_idx(model: nn.Module) -> None:
-    """Stamp ``layer_idx`` on attention modules that lack it.
+    """Stamp ``layer_idx`` on every ``*SelfAttention`` module that lacks it.
 
-    DistilBertSelfAttention participates in HuggingFace's ALL_ATTENTION_FUNCTIONS
-    dispatch (so vllm_attention_forward is called) but never sets layer_idx —
-    unlike BertSelfAttention which accepts it as a constructor arg. Walk the
-    model in named_modules order and assign sequential indices to any attention
-    module missing the attribute.
+    vLLM's ``vllm_attention_forward`` looks up the attention instance by
+    ``module.layer_idx``. Models like DistilBERT route through
+    ``ALL_ATTENTION_FUNCTIONS`` but never set ``layer_idx`` on their
+    ``SelfAttention`` — unlike BERT/RoBERTa which accept it as a constructor arg.
+    Walk the model in ``modules()`` traversal order (which matches
+    ``create_attention_instances``' 0..N-1 ordering) and assign sequential indices
+    to any attention module missing the attribute.
     """
     idx = 0
     for module in model.modules():
@@ -203,17 +205,27 @@ def _gather_free_forward(
     inputs_embeds=None,
     past_key_values_length=0,
 ):
-    """Forward that bypasses HF's token_type_ids integer-indexing branches.
+    """Forward for RoBERTa/XLM-RoBERTa embeddings that avoids integer indexing.
 
-    HF's RobertaEmbeddings/XLMRobertaEmbeddings forward has two branches for
+    HF's ``RobertaEmbeddings``/``XLMRobertaEmbeddings`` has two branches for
     ``token_type_ids``:
-    * buffer present  → ``torch.gather`` (not supported on Spyre layout remapper)
-    * buffer absent   → ``torch.zeros(..., dtype=torch.long)`` (triggers int64→int32
-                         downcast and ReStickifyOpHBM compile crash on Spyre)
 
-    RoBERTa / XLM-RoBERTa only has one token type, so the result is always weight[0]
-    broadcast. This forward slices and expands weight[0] directly, keeping the graph
-    float-only.
+    * buffer present → ``torch.gather`` on int64 position IDs
+      (not supported on the Spyre layout remapper; torch-spyre issue TBD)
+    * buffer absent  → ``torch.zeros(..., dtype=torch.long)``
+      (int64→int32 downcast triggers a ``ReStickifyOpHBM`` crash in the Spyre
+      inductor codegen; torch-spyre issue TBD)
+
+    RoBERTa and XLM-RoBERTa have ``type_vocab_size=2`` but only ever use token
+    type 0 — vLLM's Transformers backend never passes ``token_type_ids``, so the
+    result is always ``weight[0]`` broadcast. This forward computes that directly,
+    keeping the graph float-only.
+
+    **Do not apply to BERT-style pair inputs** (NSP / sentence-pair tasks) where
+    ``token_type_ids`` carry meaningful segment information.
+    ``_patch_xlm_roberta_gather`` only installs this on
+    ``RobertaEmbeddings`` / ``XLMRobertaEmbeddings`` modules, which are
+    single-type by design.
     """
     if input_ids is not None:
         batch_size, seq_length = input_ids.shape
@@ -241,61 +253,49 @@ def _gather_free_forward(
 
 
 def _patch_xlm_roberta_gather(model: nn.Module) -> None:
-    """Replace ``RobertaEmbeddings`` / ``XLMRobertaEmbeddings`` child modules with
-    gather-free subclasses.
+    """Bind ``_gather_free_forward`` onto any ``RobertaEmbeddings`` /
+    ``XLMRobertaEmbeddings`` instance found in *model*.
 
-    The replacement is done by swapping the child module on the parent (standard PyTorch
-    pattern) rather than mutating ``__class__`` in-place.
+    Uses instance-level method binding (``forward.__get__``) so the original
+    class is not mutated and no module swap is required.
     """
-    _RobertaEmbeddings: type | None = None
-    _RobertaEmbeddingsSpyre: type | None = None
+    target_classes: list[type] = []
     try:
         from transformers.models.roberta.modeling_roberta import (
             RobertaEmbeddings as _RobertaEmbeddings,
         )
 
-        class _RobertaEmbeddingsSpyre(_RobertaEmbeddings):
-            forward = _gather_free_forward
-
+        target_classes.append(_RobertaEmbeddings)
     except ImportError:
         pass
-
-    _XLMRobertaEmbeddings: type | None = None
-    _XLMRobertaEmbeddingsSpyre: type | None = None
     try:
         from transformers.models.xlm_roberta.modeling_xlm_roberta import (
             XLMRobertaEmbeddings as _XLMRobertaEmbeddings,
         )
 
-        class _XLMRobertaEmbeddingsSpyre(_XLMRobertaEmbeddings):
-            forward = _gather_free_forward
-
+        target_classes.append(_XLMRobertaEmbeddings)
     except ImportError:
         pass
-
-    replacements: list[tuple[type, type]] = []
-    if _RobertaEmbeddings is not None:
-        assert _RobertaEmbeddingsSpyre is not None
-        replacements.append((_RobertaEmbeddings, _RobertaEmbeddingsSpyre))
-    if _XLMRobertaEmbeddings is not None:
-        assert _XLMRobertaEmbeddingsSpyre is not None
-        replacements.append((_XLMRobertaEmbeddings, _XLMRobertaEmbeddingsSpyre))
-    if not replacements:
+    if not target_classes:
         return
 
-    for parent_name, parent in model.named_modules():
-        for child_name, child in list(parent.named_children()):
-            for base_cls, spyre_cls in replacements:
-                if type(child) is base_cls:
-                    new_child = cast(object, spyre_cls).__new__(spyre_cls)
-                    new_child.__dict__ = child.__dict__
-                    setattr(parent, child_name, new_child)
-                    logger.debug(
-                        "%s.%s: replaced %s with gather-free subclass",
-                        parent_name or "model",
-                        child_name,
-                        base_cls.__name__,
-                    )
+    for name, module in model.named_modules():
+        if type(module) in target_classes:
+            module.forward = _gather_free_forward.__get__(module, type(module))
+            logger.debug("patched %s with gather-free forward", name or "model")
+
+
+def _apply_spyre_encoder_patches(model: nn.Module) -> None:
+    """Apply all Spyre encoder-model patches after weights are loaded.
+
+    Called from ``load_weights`` in both encoder backend classes.  Each
+    sub-patch guards itself: ``_stamp_layer_idx`` skips modules that already
+    carry ``layer_idx``; ``_patch_xlm_roberta_gather`` only fires when
+    ``RobertaEmbeddings`` / ``XLMRobertaEmbeddings`` is present.  Both are
+    no-ops on models that do not need them.
+    """
+    _stamp_layer_idx(model)
+    _patch_xlm_roberta_gather(model)
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.Module:
@@ -440,7 +440,7 @@ class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         result = super().load_weights(weights)
         hf_model = self.model.model if hasattr(self.model, "model") else self.model
-        _patch_xlm_roberta_gather(hf_model)
+        _apply_spyre_encoder_patches(hf_model)
         return result
 
 
@@ -457,12 +457,11 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
         SpyreTransformersForCausalLM._fix_generic_config(vllm_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
-        # SequenceClassificationMixin only extracts `classifier` from the
-        # ForSequenceClassification model. Models like DistilBERT have an
-        # additional head layer (pre_classifier) with checkpoint weights that
-        # must be registered so the weight loader can place them. Only register
-        # modules that actually have parameters — parameter-free modules like
-        # nn.Dropout have no checkpoint weights and belong to no model's loader.
+        # SequenceClassificationMixin only extracts `classifier` (or `score`) from the
+        # ForSequenceClassification model. Models like DistilBERT have an additional
+        # head layer (pre_classifier) with checkpoint weights that must be registered so
+        # the weight loader can place them. Only register modules that actually have
+        # parameters — parameter-free modules like nn.Dropout have no checkpoint weights.
         with torch.device("meta"):
             seq_cls_model = AutoModelForSequenceClassification.from_config(
                 self.model.config,
@@ -475,26 +474,58 @@ class SpyreTransformersForSequenceClassification(TransformersForSequenceClassifi
                 setattr(self, name, module)
                 self.init_parameters(module)
 
-        # DistilBERT's DistilBertSelfAttention does not set layer_idx (unlike
-        # BertSelfAttention), but vllm_attention_forward requires it to look up
-        # the attention instance. Stamp it here in traversal order so the index
-        # matches the attention_instances dict built by create_attention_instances.
-        _stamp_layer_idx(self.model)
+        # SequenceClassificationMixin builds self.pooler with classifier=self.classifier
+        # before this __init__ runs. ClassifierPoolerHead stores that reference directly,
+        # so rebinding self.classifier afterwards alone would not update the pooler.
+        # We must update both self.classifier and the pooler's head reference.
+        #
+        # vLLM's Base.forward calls self.model (the backbone), not
+        # ForSequenceClassification.forward. For DistilBERT that means
+        # pre_classifier → ReLU → classifier is never invoked automatically.
+        # We wire it in via _PreClassifierHead. ClassifierWithReshape (added by the
+        # mixin) also produces a spurious [B,1,num_labels] output for plain nn.Linear
+        # classifiers; both wrappers squeeze it back to [B,num_labels].
+        pre_classifier = getattr(self, "pre_classifier", None)
+        if pre_classifier is not None and isinstance(pre_classifier, nn.Linear):
+            original_classifier = self.classifier
 
-        # SequenceClassificationMixin wraps self.classifier with ClassifierWithReshape
-        # which unsqueezes input to [batch, 1, hidden] before calling forward. This is
-        # correct for classifiers that expect a sequence dim, but plain nn.Linear
-        # (e.g. DistilBERT) broadcasts the extra dim through, producing [batch, 1,
-        # num_labels] output that fails ClassificationOutput's 1-D check. Revert to
-        # the original class when the base is nn.Linear.
-        original_cls = type(self.classifier).__bases__[0]
-        if issubclass(original_cls, nn.Linear):
-            self.classifier.__class__ = original_cls
+            class _PreClassifierHead(nn.Module):
+                def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+                    x = pre_classifier(x)
+                    x = nn.functional.relu(x)
+                    out = original_classifier(x)
+                    if out.ndim == 3 and out.shape[1] == 1:
+                        out = out.squeeze(1)
+                    return out
+
+            new_head = _PreClassifierHead()
+        else:
+            original_classifier = self.classifier
+
+            class _SqueezeHead(nn.Module):
+                def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+                    out = original_classifier(x)
+                    if out.ndim == 3 and out.shape[1] == 1:
+                        out = out.squeeze(1)
+                    return out
+
+            new_head = _SqueezeHead()
+
+        self.classifier = new_head
+        classify_pooler = self.pooler.poolers_by_task.get("classify")
+        if classify_pooler is not None:
+            classify_pooler.head.classifier = new_head
 
         logger.debug(
             "SpyreTransformersForSequenceClassification ready: %s",
             type(self.model).__name__,
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        hf_model = self.model.model if hasattr(self.model, "model") else self.model
+        _apply_spyre_encoder_patches(hf_model)
+        return result
 
 
 # Same aliasing requirement as SpyreTransformersForCausalLM.

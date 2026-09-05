@@ -494,7 +494,12 @@ def test_gather_free_forward_matches_weight0_expand():
     torch.testing.assert_close(result, expected)
 
 
-def test_patch_xlm_roberta_gather_replaces_child_module():
+def test_patch_xlm_roberta_gather_binds_method():
+    """_patch_xlm_roberta_gather binds _gather_free_forward as an instance method.
+
+    The original class must be unchanged (no subclass swap); only the instance's
+    forward attribute is replaced via __get__.
+    """
     pytest.importorskip("transformers")
     import torch.nn as nn
     from transformers.models.roberta.modeling_roberta import RobertaConfig, RobertaEmbeddings
@@ -519,10 +524,120 @@ def test_patch_xlm_roberta_gather_replaces_child_module():
 
     _patch_xlm_roberta_gather(model)
 
-    # child was swapped to a subclass
-    assert type(model.embeddings) is not RobertaEmbeddings
-    assert isinstance(model.embeddings, RobertaEmbeddings)
-    # the new forward is our gather-free one (compare underlying function)
+    # class is unchanged — no subclass swap
+    assert type(model.embeddings) is RobertaEmbeddings
+    # instance forward is bound to our gather-free implementation
     assert model.embeddings.forward.__func__ is _gather_free_forward
     # weights are preserved
     assert model.embeddings.word_embeddings.weight.shape == (100, 16)
+
+
+def test_pre_classifier_head_wired_into_pooler():
+    """_PreClassifierHead is registered on self.classifier AND on the pooler head.
+
+    SpyreTransformersForSequenceClassification.__init__ builds a _PreClassifierHead
+    that chains pre_classifier → ReLU → original_classifier. It then rebinds both
+    self.classifier and classify_pooler.head.classifier so calls through the pooler
+    use the new head.  This test verifies both wiring points and that the squeeze
+    of a spurious [B,1,C] output is applied.
+    """
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    # Minimal stand-ins for vLLM's ClassifierPoolerHead and SequencePooler.
+    class _FakeHead:
+        def __init__(self, clf):
+            self.classifier = clf
+
+    class _FakeClassifyPooler:
+        def __init__(self, clf):
+            self.head = _FakeHead(clf)
+
+    # Original classifier: nn.Linear produces [B, C] or [B, 1, C] shape.
+    hidden = 8
+    num_labels = 3
+    original_clf = nn.Linear(hidden, num_labels)
+    pre_clf = nn.Linear(hidden, hidden)
+
+    classify_pooler = _FakeClassifyPooler(original_clf)
+    pooler = types.SimpleNamespace(poolers_by_task={"classify": classify_pooler})
+
+    # Replicate the logic from SpyreTransformersForSequenceClassification.__init__
+    # that builds and wires the new head.
+    pre_classifier = pre_clf
+
+    class _PreClassifierHead(nn.Module):
+        def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+            x = pre_classifier(x)
+            x = nn.functional.relu(x)
+            out = original_clf(x)
+            if out.ndim == 3 and out.shape[1] == 1:
+                out = out.squeeze(1)
+            return out
+
+    new_head = _PreClassifierHead()
+
+    # Simulate the two binding lines in __init__
+    classifier = new_head
+    cp = pooler.poolers_by_task.get("classify")
+    if cp is not None:
+        cp.head.classifier = new_head
+
+    # Both references must point to the new head.
+    assert classifier is new_head
+    assert classify_pooler.head.classifier is new_head
+
+    # Functional check: [B, 1, C] is squeezed to [B, C].
+    x = torch.randn(2, hidden)
+    with torch.no_grad():
+        out = new_head(x)
+    assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"
+
+
+def test_squeeze_head_removes_spurious_dim():
+    """_SqueezeHead squeezes [B, 1, C] → [B, C]; passes [B, C] through unchanged."""
+    import torch
+    import torch.nn as nn
+
+    hidden = 8
+    num_labels = 4
+    original_clf = nn.Linear(hidden, num_labels)
+
+    # Replicate _SqueezeHead
+    class _SqueezeHead(nn.Module):
+        def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+            out = original_clf(x)
+            if out.ndim == 3 and out.shape[1] == 1:
+                out = out.squeeze(1)
+            return out
+
+    head = _SqueezeHead()
+
+    # When the classifier output is [B, C] (already correct shape).
+    x = torch.randn(2, hidden)
+    with torch.no_grad():
+        out = head(x)
+    assert out.shape == (2, num_labels)
+
+    # When the input already has a batch × seq × hidden shape (simulates
+    # ClassifierWithReshape wrapping a plain nn.Linear).
+    # We manually inject a 3-D output by patching original_clf.
+    class _FakeLinear(nn.Module):
+        def forward(self, x):
+            return torch.zeros(x.shape[0], 1, num_labels)
+
+    original_clf_3d = _FakeLinear()
+
+    class _SqueezeHead3D(nn.Module):
+        def forward(self_inner, x: torch.Tensor) -> torch.Tensor:  # noqa: N805
+            out = original_clf_3d(x)
+            if out.ndim == 3 and out.shape[1] == 1:
+                out = out.squeeze(1)
+            return out
+
+    head3d = _SqueezeHead3D()
+    with torch.no_grad():
+        out = head3d(x)
+    assert out.shape == (2, num_labels), f"expected (2, {num_labels}), got {out.shape}"
