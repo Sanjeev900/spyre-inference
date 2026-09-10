@@ -15,6 +15,7 @@ gated_models:
 
 public_models:
   - mistralai/Mistral-7B-Instruct-v0.3
+  - mistralai/Ministral-3-14B-Instruct-2512-BF16
   - BAAI/bge-base-en-v1.5
   - sentence-transformers/all-MiniLM-L12-v2
   - ibm-granite/granite-embedding-125m-english
@@ -31,3 +32,5 @@ public_models:
   - repo: google/gemma-4-31B
     revision: 5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89
   - qwrt/Swedish0.1M
+  - distilbert/distilbert-base-uncased-finetuned-sst-2-english
+  - papluca/xlm-roberta-base-language-detection

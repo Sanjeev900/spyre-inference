@@ -277,7 +277,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
-    Mirrors the page gather in _create_compilable_page_attn, but with a 0-dim
+    Mirrors the page gather in _page_attn_kernel, but with a 0-dim
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
@@ -378,7 +378,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     """`k_pages[idx]` for the page gather: works compiled, fails eager.
 
-    This asymmetry is why _create_compilable_page_attn gathers with index_select,
+    This asymmetry is why _page_attn_kernel gathers with index_select,
     which works in both modes.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
@@ -766,14 +766,13 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 10. FP32 reduce then D2H (MEAN destagger — both paths fail)
+# 10. FP32 reduce then D2H (MEAN destagger)
 # ---------------------------------------------------------------------------
 #
-# Device fp32 is staggered inside sticks (torch-spyre#2971). A raw convert
-# of the reduction is interleaved garbage. Downcast to fp16, convert, then
-# upcast is also garbage (e5/roberta cosine ~-0.02). MEAN therefore copies
-# packed fp16 and reduces on the host. When either XPASS-es, MEAN can
-# destagger a device fp32 sum and copy [B, H].
+# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
+# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
+# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
+# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
 
 
 def _fp32_mean_reduction(spyre_device):
@@ -805,16 +804,8 @@ def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
     torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "to(fp16) then convert then upcast is also garbage (e5/roberta cosine "
-        "~-0.02). MEAN copies packed fp16 and reduces on the host. When this "
-        "XPASS-es, MEAN can destagger a device fp32 sum."
-    ),
-)
 def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
-    """to(fp16) before convert does not un-stagger a device fp32 sum."""
+    """to(fp16) before convert un-staggers a device fp32 sum."""
     acc, ref = _fp32_mean_reduction(spyre_device)
     torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
 
@@ -893,3 +884,50 @@ def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
         if not re.search(rf"""register_buffer\(\s*["']{name}["']""", src)
     ]
     assert not plain, f"still plain attributes upstream: {plain}"
+
+
+# ---------------------------------------------------------------------------
+# 13. Short-row matmul scheduling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
+        "same weight sustains with a full 8-row block, so padding the activation out "
+        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
+        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
+        "constants it reads. Tracked by torch-spyre#4032."
+    ),
+)
+def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
+    """A 1-row GEMM should not cost more than the same weight against 8 rows."""
+    import time
+
+    from torch_spyre.streams import synchronize
+
+    # granite-3.3-8b's gate_up_proj weight_t -- the shape the workaround targets.
+    weight = torch.randn(4096, 25600, dtype=torch.float16, device=spyre_device)
+    activations = {
+        m: torch.randn(m, 4096, dtype=torch.float16, device=spyre_device) for m in (1, 8)
+    }
+
+    def best_of(rows, reps=8):
+        best = float("inf")
+        for _ in range(reps):
+            start = time.perf_counter()
+            torch.matmul(activations[rows], weight)
+            synchronize()
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    for rows in (1, 8):  # compile and warm both kernels before timing either
+        best_of(rows, reps=3)
+    one_row, full_block = best_of(1), best_of(8)
+
+    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
+    assert one_row <= 1.10 * full_block, (
+        f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
+        f"({100 * (one_row / full_block - 1):.0f}% slower)"
+    )
