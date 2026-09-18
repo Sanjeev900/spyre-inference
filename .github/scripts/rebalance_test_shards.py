@@ -68,6 +68,14 @@ SUITES = [
         "collect_upstream": False,
     },
     {"key": "probe", "makefile_name": "probes", "var": "PROBE_SHARDS", "collect_upstream": False},
+    {
+        "key": "quality",
+        "makefile_name": "quality",
+        "var": "QUALITY_SHARDS",
+        # Folds in the GSM8K accuracy evals (gsm8k marker), which live in the upstream
+        # vLLM tree, so collecting this suite needs the upstream checkout cloned.
+        "collect_upstream": True,
+    },
 ]
 
 

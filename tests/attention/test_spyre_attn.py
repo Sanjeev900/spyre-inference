@@ -18,37 +18,40 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from spyre_testing_plugin.attn_helpers import (
+    _build_metadata,
+    _fused_qkv_kv_views,
+    _padded_mask_metadata,
+    assert_close_outliers,
+    ref_attn,
+)
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    _MIN_BATCHED_SEQS,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
-    _create_compilable_bucketed_decode_attn,
     _mirror_mask_tiles,
 )
+from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
 
 
 @pytest.fixture()
-def enable_bucketed_decode(monkeypatch):
-    """Enable the bucketed decode kernel for tests that exercise it.
-
-    The path ships gated off (``SPYRE_BUCKETED_DECODE``, default "0") pending
-    performance characterisation at the smallest bucket. Without this fixture the
-    bucketed tests would silently fall back to the per-seq loop and pass while
-    testing nothing. The autouse cache-clearing fixture in ``tests/conftest.py``
-    makes the monkeypatched value visible to ``envs``.
+def enable_batched_decode(monkeypatch):
+    """Pin ``SPYRE_BATCHED_DECODE`` on, so the batched tests cannot silently fall
+    back to the per-seq loop if the default changes. The autouse cache-clearing
+    fixture in ``tests/conftest.py`` makes the value visible to ``envs``.
     """
-    monkeypatch.setenv("SPYRE_BUCKETED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
 
 @pytest.fixture()
@@ -97,167 +100,6 @@ def configure_compilation(request, monkeypatch):
     torch._dynamo.reset()
 
 
-def _fused_qkv_kv_views(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """K/V as the backend receives them: strided last-dim views of a fused QKV
-    on ``device``, which contiguous k/v would not exercise."""
-    num_tokens = query.shape[0]
-    slabs = [t.reshape(num_tokens, -1) for t in (query, key, value)]
-    qkv = convert(torch.cat(slabs, dim=-1), device)
-    _, k_view, v_view = qkv.split([s.shape[-1] for s in slabs], dim=-1)
-    return (
-        k_view.view(num_tokens, key.shape[1], key.shape[2]),
-        v_view.view(num_tokens, value.shape[1], value.shape[2]),
-    )
-
-
-def _build_metadata(
-    num_query_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    block_size: int,
-    seq_lens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    block_table: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    sliding_window: int | None = None,
-):
-    """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
-    from vllm.config import get_current_vllm_config
-
-    # Reuse the VllmConfig set up by the `default_vllm_config` fixture and
-    # stub the head-count methods the builder reads.
-    vllm_config = get_current_vllm_config()
-    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
-    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
-    # The builder asserts these agree, and derives its padding buckets from the
-    # cache_config one, so a test block_size has to be set in both places.
-    vllm_config.cache_config.block_size = block_size
-
-    if sliding_window is not None:
-        kv_cache_spec = FullAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            head_size_v=head_size,
-            dtype=torch.float16,
-            sliding_window=sliding_window,
-        )
-    else:
-        kv_cache_spec = AttentionSpec(
-            block_size=block_size,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            dtype=torch.float16,
-        )
-
-    builder = SpyreAttentionMetadataBuilder(
-        kv_cache_spec=kv_cache_spec,
-        layer_names=["layers.0.self_attn"],
-        vllm_config=vllm_config,
-        device=torch.device("cpu"),
-    )
-
-    max_query_len = int((query_start_loc[1:] - query_start_loc[:-1]).max().item())
-    max_seq_len = int(seq_lens.max().item())
-    num_actual_tokens = int(query_start_loc[-1].item())
-
-    common_metadata = CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc,
-        seq_lens=seq_lens,
-        num_reqs=len(seq_lens),
-        num_actual_tokens=num_actual_tokens,
-        max_query_len=max_query_len,
-        max_seq_len=max_seq_len,
-        block_table_tensor=block_table,
-        slot_mapping=slot_mapping,
-        causal=True,
-    )
-
-    return builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=common_metadata,
-    )
-
-
-def assert_close_outliers(
-    actual: torch.Tensor,
-    expected: torch.Tensor,
-    max_outliers: int = 0,
-    atol: float = 1e-8,
-    rtol: float = 1e-5,
-    *,
-    outlier_atol: float | None = None,
-    outlier_rtol: float | None = None,
-) -> None:
-    """Assert tensors are close, allowing up to *max_outliers* elements to exceed tolerance.
-
-    Arguments beyond *max_outliers* are forwarded to ``torch.testing.assert_close``.
-
-    Args:
-        actual: tensor under test.
-        expected: reference tensor.
-        max_outliers: number of elements that may exceed the base tolerances.
-        atol: absolute tolerance for the bulk of elements.
-        rtol: relative tolerance for the bulk of elements.
-        outlier_atol: absolute tolerance for outlier elements (defaults to *atol*,
-            meaning outliers only need to be finite, not within any tighter bound).
-        outlier_rtol: relative tolerance for outlier elements.
-        msg: additional context for the failure message.
-    """
-    # `NaN > tol` is False, so a non-finite actual scores zero outliers and passes
-    # the check below. Attention output is always finite, so reject it up front.
-    n_nonfinite = int((~torch.isfinite(actual)).sum())
-    if n_nonfinite:
-        raise AssertionError(
-            f"{n_nonfinite}/{actual.numel()} element(s) of actual are non-finite "
-            f"(NaN or inf); the value was never written or the kernel diverged."
-        )
-
-    diff = (actual - expected).abs()
-    tol = atol + rtol * expected.abs()
-    outlier_mask = diff > tol
-    n_outliers = outlier_mask.sum().item()
-
-    if n_outliers <= max_outliers and max_outliers > 0:
-        # Check that outliers are still within the relaxed bound (or simply finite)
-        if outlier_atol is not None or outlier_rtol is not None:
-            outlier_tol = (outlier_atol if outlier_atol is not None else atol) + (
-                outlier_rtol if outlier_rtol is not None else rtol
-            ) * expected.abs()
-            if diff[outlier_mask].gt(outlier_tol[outlier_mask]).any():
-                worst = diff[outlier_mask].max().item()
-                raise AssertionError(
-                    f"{n_outliers} outlier(s) exceed base tolerances, "
-                    f"and at least one outlier also exceeds the relaxed bound "
-                    f"(worst diff={worst:.4g})."
-                )
-        if n_outliers > 0:
-            print(
-                f"  [assert_close_outliers] {n_outliers}/{actual.numel()} element(s) "
-                f"exceed base tolerance but remain within relaxed bound — acceptable."
-            )
-        return  # acceptable number of outliers within relaxed bounds
-
-    # Fall through to standard assert_close for a clear error message
-    try:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-    except AssertionError as e:
-        prefix = (
-            f"{n_outliers} elements exceed atol={atol}, rtol={rtol}. "
-            if n_outliers > max_outliers
-            else ""
-        )
-        raise AssertionError(
-            f"{prefix}"
-            f"max_outliers={max_outliers} was specified "
-            f"but {n_outliers} element(s) exceed tolerance.\n"
-            f"{e}"
-        ) from e
-
-
 def _alibi_slopes(num_heads: int) -> list[float]:
     """Standard ALiBi slope generator (Press et al. 2022).
 
@@ -275,78 +117,6 @@ def _alibi_slopes(num_heads: int) -> list[float]:
     return _pow2(closest) + _pow2(2 * closest)[0::2][: num_heads - closest]
 
 
-def ref_attn(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    query_lens: list[int],
-    kv_lens: list[int],
-    block_tables: torch.Tensor,
-    block_size: int,
-    scale: float,
-    sliding_window: int | None = None,
-    soft_cap: float | None = None,
-    alibi_slopes: list[float] | None = None,
-) -> torch.Tensor:
-    """Reference implementation of attention for validation."""
-    num_seqs = len(query_lens)
-    block_tables_np = block_tables.cpu().numpy()
-
-    outputs: list[torch.Tensor] = []
-    start_idx = 0
-    for i in range(num_seqs):
-        query_len = query_lens[i]
-        kv_len = kv_lens[i]
-        q = query[start_idx : start_idx + query_len]
-        q = q * scale
-
-        num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables_np[i, :num_kv_blocks]
-
-        # Pages are token-major, so dim 0 of the concat is the token axis.
-        k_blocks = [key_cache[idx] for idx in block_indices]
-        v_blocks = [value_cache[idx] for idx in block_indices]
-        k = torch.cat(k_blocks, dim=0)[:kv_len]  # [kv_len, num_kv_heads, head_size]
-        v = torch.cat(v_blocks, dim=0)[:kv_len]
-
-        if q.shape[1] != k.shape[1]:
-            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-        if sliding_window is not None:
-            sliding_window_mask = (
-                torch.triu(empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1)
-                .bool()
-                .logical_not()
-            )
-            mask |= sliding_window_mask
-        if soft_cap is not None and soft_cap > 0:
-            attn = soft_cap * torch.tanh(attn / soft_cap)
-        if alibi_slopes is not None:
-            # bias[h, q, k] = slope[h] * (k_abs_pos - q_abs_pos), applied before mask.
-            # Under strict causal decoding the q_abs_pos term cancels through
-            # softmax, so any per-row-constant simplification is equivalent —
-            # keep the full form here for clarity in the reference.
-            slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
-            context_len = kv_len - query_len
-            q_abs = torch.arange(query_len, dtype=torch.float32) + context_len
-            kv_abs = torch.arange(kv_len, dtype=torch.float32)
-            rel = kv_abs.unsqueeze(0) - q_abs.unsqueeze(1)  # [query_len, kv_len]
-            bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
-            attn = attn + bias
-        attn.masked_fill_(mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
-        out = torch.einsum("hqk,khd->qhd", attn, v)
-
-        outputs.append(out)
-        start_idx += query_len
-
-    return torch.cat(outputs, dim=0)
-
-
 @torch.inference_mode()
 def _run_spyre_attn_test(
     seq_lens: list[tuple[int, int]],
@@ -360,6 +130,7 @@ def _run_spyre_attn_test(
     num_kv_heads: int = 8,
     head_size: int = 128,
     expect_fused_store: bool | None = None,
+    expect_query_widths: set[int] | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -462,6 +233,19 @@ def _run_spyre_attn_test(
         logits_soft_cap=soft_cap,
     )
 
+    # The fused store is just whether the kernel was handed an `out` buffer.
+    fused_calls: list[bool] = []
+    dispatched_widths: set[int] = set()
+    if expect_fused_store is not None or expect_query_widths is not None:
+        _real_attn_fn = attn_impl._attn_fn
+
+        def _spy_attn_fn(*a, **kw):
+            fused_calls.append(a[-1] is not None)
+            dispatched_widths.add(a[8])  # padded_query_len
+            return _real_attn_fn(*a, **kw)
+
+        attn_impl._attn_fn = _spy_attn_fn
+
     # NaN, not empty_like: every row is expected to be written, so a store that
     # lands nowhere fails below instead of passing on whatever the allocator gave.
     output = torch.full_like(query, float("nan")).to(cache_device)
@@ -488,12 +272,15 @@ def _run_spyre_attn_test(
     )
 
     if expect_fused_store is not None:
-        # Kernel cache keys are
-        # (num_blocks, padded_query_len, store_mode, needs_gather).
-        fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
-        assert fused_used == expect_fused_store, (
-            f"fused output store: expected {expect_fused_store}, got {fused_used} "
-            f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
+        assert fused_calls, "no attention kernel ran"
+        assert set(fused_calls) == {expect_fused_store}, (
+            f"fused output store: expected {expect_fused_store}, got {set(fused_calls)}"
+        )
+
+    if expect_query_widths is not None:
+        assert dispatched_widths == expect_query_widths, (
+            f"query widths dispatched: expected {expect_query_widths}, "
+            f"got {sorted(dispatched_widths)}"
         )
 
     ref_output = ref_attn(
@@ -950,6 +737,44 @@ def test_spyre_attn_chunked_prefill(
     ],
     indirect=True,
 )
+def test_mixed_batch_dispatches_decode_at_query_width_one(
+    default_vllm_config,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """A decoding sequence in a mixed batch keeps the query_len=1 kernel."""
+    from vllm.config import get_current_vllm_config
+
+    chunk_len = 64
+    chunk_bucket = SpyreAttnBucketer(get_current_vllm_config()).find_query_bucket(chunk_len)
+    assert chunk_bucket is not None and chunk_bucket > 1
+
+    _run_spyre_attn_test(
+        seq_lens=[(chunk_len, 256), (1, 256), (1, 512)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        expect_query_widths={1, chunk_bucket},
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -1150,7 +975,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     ), f"Unexpected KV cache shape: {shape}"
 
     # The runner must allocate exactly the shape it advertises.
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
     spec = AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
@@ -1176,6 +1001,11 @@ def test_kv_cache_shape_matches_runner_allocation():
     fake_layer.kv_cache = None
     runner.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
 
+    # spyre_available() allocates on the device, which creates the RuntimeContext that
+    # initialize_kv_cache_tensors' layout-carrying transfer needs but will not create.
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
     k_pages = caches["layers.0.self_attn"].k_pages
     v_pages = caches["layers.0.self_attn"].v_pages
@@ -1186,6 +1016,13 @@ def test_kv_cache_shape_matches_runner_allocation():
     # Sanity: the physical layout is token-major (block_size before num_kv_heads),
     # and each page is contiguous in the last two dims.
     assert k_pages.shape == (num_blocks, block_size, num_kv_heads, head_size)
+
+    # The paged scatter indexes dim 0, so the slot axis has to stay whole at device
+    # position 0: the default tiled layout splits it across two device dims and writes
+    # the wrong rows (torch-spyre#3705).
+    num_slots = num_blocks * block_size
+    for pages in (k_pages, v_pages):
+        assert pages.device_tensor_layout().device_size[0] == num_slots
 
 
 def test_sliding_window_none_equivalence(default_vllm_config):
@@ -1614,7 +1451,7 @@ class _StubAttentionLayer:
 
     def __init__(self, attn_type: str):
         self.attn_type = attn_type
-        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
+        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views", "kv_write_index"])
         self.kv_sharing_target_layer_name = None
         self.query_quant = None
         self.kv_cache: list[torch.Tensor] = []
@@ -1688,14 +1525,21 @@ def test_install_patches_layers_not_the_attention_class():
         ),
     ],
 )
-def test_spyre_attn_bucketed_decode_correctness(
+def test_spyre_attn_batched_decode_correctness(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode fast path: bit-exact vs the per-seq reference."""
+    """Batched decode fast path agrees with the per-seq reference.
+
+    Not bit-exact, and cannot be: the chunked reduction sums in a different
+    order and gives blocks_per_chunk blocks one shared max, so in fp16 a logit
+    far below its chunk max underflows where the per-seq kernel keeps it. The
+    runner's tolerances are correspondingly loose; the accuracy claim for the
+    reduction itself is carried by test_batched_decode_matches_fp32_reference.
+    """
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1743,15 +1587,15 @@ def test_spyre_attn_bucketed_decode_correctness(
     ],
 )
 @pytest.mark.parametrize("soft_cap", [pytest.param(50.0, id="soft_cap(50)")])
-def test_spyre_attn_bucketed_decode_soft_cap(
+def test_spyre_attn_batched_decode_soft_cap(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     soft_cap: float,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode with logits soft-cap, vs the per-seq reference."""
+    """Batched decode with logits soft-cap, vs the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1762,44 +1606,333 @@ def test_spyre_attn_bucketed_decode_soft_cap(
     )
 
 
-def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
+def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     """The capped kernel must actually clamp, not silently ignore the cap."""
     torch.set_default_device("cpu")
     set_random_seed(0)
 
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
-    lead = num_seqs * num_kv_heads
-
-    def build(cap: float):
-        return _create_compilable_bucketed_decode_attn(
-            num_seqs=num_seqs,
-            num_blocks=num_blocks,
-            num_kv_heads=num_kv_heads,
-            num_queries_per_kv=qpk,
-            block_size=block_size,
-            head_size=head_size,
-            logits_soft_cap=cap,
-            needs_gather=False,
-        )
+    # One chunk covering both blocks, so entries = num_seqs * 2.
+    bpc = num_blocks
+    num_chunks = num_blocks // bpc
+    entries = num_seqs * bpc
 
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    block_ids = torch.arange(n_pages, dtype=torch.int64)
-    mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
-    query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
-    # Trailing None is the `out` buffer; unused because store_out defaults to False.
-    args = (query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, 1.0, None)
+    # int64 here, not the production int32: this runs eager on CPU, where
+    # advanced indexing needs int64.
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat_interleave(bpc)
+    # [num_blocks, num_seqs] transposed to entry order (seq major, slot minor).
+    block_ids = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
+    chunk_page_ids = [
+        block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
+        for c in range(num_chunks)
+    ]
+    mask_by_chunk = torch.zeros(
+        num_chunks, entries * num_kv_heads, 1, block_size, dtype=torch.float32
+    )
 
-    uncapped = build(0.0)(*args)
-    capped = build(5.0)(*args)
+    def run(cap: float):
+        return batched_decode_kernel(
+            query,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_page_ids,
+            mask_by_chunk,
+            1.0,
+            num_seqs,
+            bpc,
+            num_kv_heads,
+            qpk,
+            block_size,
+            head_size,
+            logits_soft_cap=cap,
+        )
+
+    uncapped = run(0.0)
+    capped = run(5.0)
 
     assert not torch.allclose(uncapped, capped), (
         "soft-cap did not change the output; the capped kernel may be ignoring it"
     )
     assert torch.isfinite(capped).all()
+
+
+@pytest.mark.parametrize("max_num_seqs", [4, 5, 6, 8, 10, 16, 32])
+@pytest.mark.parametrize("max_model_len", [512, 1536, 2048, 4096, 10000])
+def test_batched_decode_chunking_covers_every_block(
+    default_vllm_config,
+    enable_batched_decode,
+    max_num_seqs: int,
+    max_model_len: int,
+) -> None:
+    """Every block of every sequence reaches a chunk, for any bucket pair.
+
+    blocks_per_chunk is capped, not chosen as a divisor, so the block axis has to
+    be padded up to a multiple of it. Neither bucket lattice is all powers of two
+    -- _powers_of_two_up_to appends n itself -- so an uneven pair is reachable
+    from ordinary engine args (max_model_len=1536 gives 12 blocks, and 8 does not
+    divide 12). Getting this wrong drops the tail blocks and then raises on the
+    mask reshape, i.e. crashes a decode step. Card-free on purpose: the
+    integration tests all land on power-of-two buckets, where it cannot fire.
+    """
+    from vllm.config import get_current_vllm_config
+
+    torch.set_default_device("cpu")
+    block_size = 128
+    num_kv_heads, head_size = 2, 64
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    vllm_config.model_config.max_model_len = max_model_len
+
+    max_blocks = (max_model_len + block_size - 1) // block_size
+    # Longest sequence the config allows: the block bucket is picked off the
+    # real block count, so this is what reaches the lattice's top entry.
+    ctx = max_model_len
+
+    for num_seqs in range(_MIN_BATCHED_SEQS, max_num_seqs + 1):
+        seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
+        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+        block_table = torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
+            num_seqs, max_blocks
+        )
+        slot_mapping = (seq_lens.to(torch.int64) - 1) + torch.arange(num_seqs) * ctx
+
+        md = _build_metadata(
+            num_query_heads=num_kv_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            block_size=block_size,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+        )
+
+        assert md.blocks_per_chunk is not None, (
+            f"batched decode declined num_seqs={num_seqs}, which it should accept"
+        )
+        bpc = md.blocks_per_chunk
+        padded = md.padded_batch_blocks
+        assert padded is not None
+        assert padded % bpc == 0, (
+            f"max_num_seqs={max_num_seqs} max_model_len={max_model_len} "
+            f"num_seqs={num_seqs}: {padded} blocks is not a multiple of "
+            f"blocks_per_chunk={bpc}"
+        )
+        assert padded >= max_blocks, (
+            f"max_num_seqs={max_num_seqs} max_model_len={max_model_len} "
+            f"num_seqs={num_seqs}: chunks cover {padded} of {max_blocks} blocks"
+        )
+        # The mask carries the same axis, so a mismatch here is the reshape that
+        # would have raised inside build().
+        assert md.mask_by_chunk_cpu is not None
+        num_chunks = md.mask_by_chunk_cpu.shape[0]
+        assert num_chunks * bpc == padded
+
+
+def test_batched_decode_mask_follows_the_layers_num_kv_heads(
+    default_vllm_config,
+    enable_batched_decode,
+) -> None:
+    """The decode mask is broadcast over the KV-cache spec's head count.
+
+    A model with per-layer head counts (gemma-4) has attention layers whose
+    num_kv_heads is not `model_config.get_num_kv_heads()`. The kernel reshapes the
+    mask with the layer's, so building it from the model-level one asks for the
+    wrong number of elements and every batched-decode variant fails to compile.
+    """
+    from vllm.config import get_current_vllm_config
+
+    torch.set_default_device("cpu")
+    block_size = 128
+    # This group's own counts; get_num_kv_heads() reports 8 below, the 4x-too-wide
+    # broadcast this guards against.
+    num_kv_heads, num_query_heads, head_size = 2, 4, 64
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.scheduler_config.max_num_seqs = _MIN_BATCHED_SEQS
+    vllm_config.model_config.max_model_len = 2048
+
+    num_seqs = _MIN_BATCHED_SEQS
+    ctx = 256
+    blocks_per_seq = ctx // block_size
+    seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
+    query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+    block_table = torch.arange(num_seqs * blocks_per_seq, dtype=torch.int32).reshape(
+        num_seqs, blocks_per_seq
+    )
+    slot_mapping = (seq_lens.to(torch.int64) - 1) + torch.arange(num_seqs) * ctx
+
+    md = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        model_num_kv_heads=8,
+    )
+
+    assert md.blocks_per_chunk is not None, "batched decode declined this batch"
+    assert md.mask_by_chunk_cpu is not None
+    entries = md.padded_num_seqs * md.blocks_per_chunk
+    assert md.mask_by_chunk_cpu.shape[1] == entries * num_kv_heads, (
+        f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; the kernel reshapes it to "
+        f"{entries} x {num_kv_heads}"
+    )
+    # The shape the kernel actually asks for.
+    md.mask_by_chunk_cpu[0].reshape(entries, num_kv_heads, 1, block_size)
+
+
+def _decode_reference_fp32(
+    query: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    page_ids: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+    num_kv_heads: int,
+    qpk: int,
+    head_size: int,
+) -> torch.Tensor:
+    """Per-sequence softmax over each sequence's own blocks, no chunking.
+
+    page_ids: [num_seqs, num_blocks]. mask: [num_seqs, num_blocks, block_size].
+    """
+    num_seqs, num_blocks = page_ids.shape
+    out = torch.zeros(num_seqs, num_kv_heads * qpk, head_size, dtype=torch.float32)
+    for s in range(num_seqs):
+        q = query[s].reshape(num_kv_heads, qpk, head_size)
+        k = torch.cat([k_pages[page_ids[s, b]] for b in range(num_blocks)], dim=0)
+        v = torch.cat([v_pages[page_ids[s, b]] for b in range(num_blocks)], dim=0)
+        # [KV, qpk, kv_len]
+        scores = torch.einsum("hqd,thd->hqt", q, k) * scale + mask[s].reshape(-1)
+        probs = torch.softmax(scores, dim=-1)
+        out[s] = torch.einsum("hqt,thd->hqd", probs, v).reshape(num_kv_heads * qpk, head_size)
+    return out.reshape(num_seqs, num_kv_heads * qpk, head_size)
+
+
+@pytest.mark.parametrize(
+    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged",
+    [
+        pytest.param(4, 4, 8, 8, 2, 1, False, id="one_chunk"),
+        pytest.param(4, 4, 8, 2, 2, 1, False, id="four_chunks"),
+        pytest.param(4, 4, 8, 1, 2, 1, False, id="bpc_1"),
+        pytest.param(3, 4, 8, 4, 2, 1, False, id="padded_batch_rows"),
+        pytest.param(4, 4, 8, 2, 2, 4, True, id="gqa_ragged"),
+        pytest.param(5, 8, 12, 4, 1, 2, True, id="uneven_buckets_ragged"),
+        # blocks_per_chunk does not divide the block count, so the kernel sees the
+        # padded block axis the builder rounds up to.
+        pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
+        pytest.param(6, 6, 10, 5, 2, 1, True, id="non_pow2_seq_bucket_ragged"),
+    ],
+)
+def test_batched_decode_matches_fp32_reference(
+    num_seqs: int,
+    b_seqs: int,
+    num_blocks: int,
+    bpc: int,
+    num_kv_heads: int,
+    qpk: int,
+    ragged: bool,
+) -> None:
+    """The chunked reduction equals an unchunked per-sequence softmax.
+
+    Card-free and in fp32, so it pins the reduction itself rather than the fp16
+    tolerances the integration tests have to use. ``ragged`` masks each sequence
+    down to a different length, which is what puts wholly--inf chunks and -inf
+    padding columns in front of the running max.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    block_size, head_size = 16, 8
+    num_heads = num_kv_heads * qpk
+    padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
+    num_chunks = padded_blocks // bpc
+    entries = b_seqs * bpc
+    scale = 0.5
+
+    n_pages = padded_blocks * b_seqs + 1
+    query = torch.randn(num_seqs, num_heads * head_size, dtype=torch.float32)
+    k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+    v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+
+    # Page 0 is the padding page, exactly as the builder leaves it.
+    page_ids = torch.zeros(b_seqs, padded_blocks, dtype=torch.int64)
+    mask = torch.full((b_seqs, padded_blocks, block_size), float("-inf"), dtype=torch.float32)
+    kv_lens = []
+    for s in range(num_seqs):
+        # A ragged batch ends each sequence mid-block, at a different block.
+        n_use = num_blocks - s if ragged else num_blocks
+        n_use = max(1, n_use)
+        tail = (block_size // 2) if ragged else block_size
+        kv_len = (n_use - 1) * block_size + tail
+        kv_lens.append(kv_len)
+        for b in range(n_use):
+            page_ids[s, b] = 1 + s * padded_blocks + b
+            valid = min(block_size, kv_len - b * block_size)
+            mask[s, b, :valid] = 0.0
+    # A row past the batch is -inf everywhere, which would make its softmax NaN;
+    # the builder keeps block 0 finite for exactly this reason.
+    mask[num_seqs:, 0] = torch.finfo(torch.float16).min
+
+    rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
+    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
+    chunk_page_ids = [
+        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
+        for c in range(num_chunks)
+    ]
+    mask_by_chunk = (
+        mask.reshape(b_seqs, num_chunks, bpc, block_size)
+        .permute(1, 0, 2, 3)
+        .unsqueeze(3)
+        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
+        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .contiguous()
+    )
+
+    query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
+    query_padded[:num_seqs] = query
+
+    actual = batched_decode_kernel(
+        query_padded,
+        rep_row_ids,
+        k_pages,
+        v_pages,
+        chunk_page_ids,
+        mask_by_chunk,
+        scale,
+        b_seqs,
+        bpc,
+        num_kv_heads,
+        qpk,
+        block_size,
+        head_size,
+    )
+
+    expected = _decode_reference_fp32(
+        query_padded,
+        k_pages,
+        v_pages,
+        page_ids,
+        mask,
+        scale,
+        num_kv_heads,
+        qpk,
+        head_size,
+    )
+
+    assert torch.isfinite(actual[:num_seqs]).all()
+    torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -1826,13 +1959,13 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
         ),
         pytest.param(
             [(1, 256), (32, 256), (1, 256), (32, 256)],
-            id="mixed_decode_prefill(fallback)",
+            id="mixed_decode_prefill_non_leading(fallback)",
         ),
     ],
 )
-def test_spyre_attn_bucketed_decode_fallback(
+def test_spyre_attn_batched_decode_fallback(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
@@ -1847,46 +1980,158 @@ def test_spyre_attn_bucketed_decode_fallback(
     )
 
 
-def _padded_mask_metadata(
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "sliding_window"),
+    [
+        # kv_lens are chosen so first_active > 0, i.e. the active blocks are a
+        # strict suffix; covers_all is the first_active == 0 control.
+        pytest.param([(1, 768)] * 8, 512, id="window512_multiblock(N=8)"),
+        pytest.param(
+            [(1, 768), (1, 896), (1, 1024), (1, 1152), (1, 1280), (1, 768)],
+            512,
+            id="window512_mixed_offsets(N=6)",
+        ),
+        pytest.param([(1, 512)] * 8, 128, id="window128_single_active(N=8)"),
+        pytest.param([(1, 768)] * 8, 500, id="window500_unaligned(N=8)"),
+        pytest.param([(1, 256)] * 8, 4096, id="window_covers_all(N=8)"),
+    ],
+)
+def test_spyre_attn_batched_decode_sliding_window(
+    default_vllm_config,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
-    block_size: int = 64,
-    sliding_window: int | None = None,
-    num_query_heads: int = 32,
-    num_kv_heads: int = 8,
-    head_size: int = 128,
-    max_num_blocks: int | None = None,
-):
-    """Build metadata on CPU for a list of (query_len, kv_len) sequences.
-
-    ``max_num_blocks`` is the block-table width build() pads onto; it defaults
-    to no headroom, so a test wanting padding to actually happen must pass a
-    wider table, as a real engine's is.
-    """
-    query_lens = [q for q, _ in seq_lens]
-    kv_lens = [kv for _, kv in seq_lens]
-    num_seqs = len(seq_lens)
-
-    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
-    )
-    kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
-    if max_num_blocks is None:
-        max_num_blocks = (max(kv_lens) + block_size - 1) // block_size
-    block_table = torch.arange(num_seqs * max_num_blocks, dtype=torch.int32).reshape(
-        num_seqs, max_num_blocks
-    )
-    slot_mapping = torch.arange(sum(query_lens), dtype=torch.int64)
-
-    return _build_metadata(
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        block_size=block_size,
-        seq_lens=kv_lens_tensor,
-        query_start_loc=cu_query_lens,
-        block_table=block_table,
-        slot_mapping=slot_mapping,
+    sliding_window: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Batched decode with a sliding window: matches the per-seq reference."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
         sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_lens", "sliding_window"),
+    [
+        pytest.param([256, 512, 128, 384, 256, 512, 128, 384], None, id="no_window_ragged"),
+        pytest.param([64, 512, 512, 512], None, id="no_window_short_first"),
+        pytest.param([1, 128, 128, 128], None, id="no_window_zero_full_blocks"),
+        pytest.param([512, 512, 512, 512], 256, id="window_uniform"),
+    ],
+)
+def test_bucketed_block_ids_match_scalar_fill(
+    default_vllm_config, kv_lens: list[int], sliding_window: int | None
+) -> None:
+    block_size = 64
+    seq_lens = [(1, kv) for kv in kv_lens]
+    metadata = _padded_mask_metadata(seq_lens, block_size=block_size, sliding_window=sliding_window)
+    assert metadata.chunk_page_ids_cpu is not None
+    assert metadata.blocks_per_chunk is not None
+    assert metadata.padded_num_seqs is not None
+
+    # Unpack the per-chunk [entries, 1] index tensors back into the
+    # [padded_batch_blocks, b_seqs] fill they were built from. Entry order is
+    # (s, j) with s major, so each chunk transposes back.
+    bpc = metadata.blocks_per_chunk
+    b_seqs = metadata.padded_num_seqs
+    chunks = metadata.chunk_page_ids_cpu
+    got = torch.zeros(len(chunks) * bpc, b_seqs, dtype=torch.int32)
+    for c, chunk in enumerate(chunks):
+        got[c * bpc : (c + 1) * bpc] = chunk.reshape(b_seqs, bpc).t()
+    assert got.shape[0] == metadata.padded_batch_blocks
+    bt = metadata.block_table
+    active = metadata.active_block_indices
+    b_blocks = got.shape[0]
+    for s, kv in enumerate(kv_lens):
+        abs_blocks = (
+            active[s] if active is not None else list(range((kv + block_size - 1) // block_size))
+        )
+        n_use = min(len(abs_blocks), b_blocks)
+        for b in range(n_use):
+            assert got[b, s].item() == bt[s, abs_blocks[b]].item(), (
+                f"seq={s} block={b}: got {got[b, s].item()}, expected {bt[s, abs_blocks[b]].item()}"
+            )
+        for b in range(n_use, b_blocks):
+            assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (32, 256)],
+            id="decode_prefix(N=4)+prefill",
+        ),
+        pytest.param(
+            [
+                (1, 256),
+                (1, 512),
+                (1, 128),
+                (1, 384),
+                (1, 256),
+                (1, 512),
+                (1, 128),
+                (1, 384),
+                (64, 256),
+                (32, 512),
+            ],
+            id="decode_prefix(N=8)+2prefills",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (32, 256)],
+            id="decode_prefix(N=5_padded_to_8)+prefill",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (2, 256)],
+            id="decode_prefix(N=5)+tiny_prefill",
+        ),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (64, 256)],
+            id="decode_prefix(N=3_below_min)+prefill",
+        ),
+        pytest.param(
+            [(1, 256), (32, 256), (1, 512), (1, 128), (1, 384)],
+            id="decode_prefill_interleaved(fallback)",
+        ),
+    ],
+)
+def test_spyre_attn_mixed_batch_batched_decode(
+    default_vllm_config,
+    enable_batched_decode,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
     )
 
 
@@ -1910,9 +2155,8 @@ def test_padded_mask_rows_equal_last_real_row(default_vllm_config, seq_lens):
     query_len = seq_lens[0][0]
     metadata = _padded_mask_metadata(seq_lens)
 
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens[0]
     if query_len == 1:
-        # A decode-only batch skips query padding entirely.
         assert aligned == 1
         return
     assert aligned >= query_len
@@ -1956,15 +2200,43 @@ def test_padded_mask_rows_isolated_across_sequences(default_vllm_config):
     torch.set_default_device("cpu")
     seq_lens = [(7, 256), (33, 512), (1, 128)]
     metadata = _padded_mask_metadata(seq_lens)
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens
+    assert aligned[2] == 1
+    assert aligned[0] > 1 and aligned[1] > 1
 
     for seq_idx, (query_len, _) in enumerate(seq_lens):
         mask = _seq_mask(metadata, seq_idx)
+        assert mask.shape[0] == aligned[seq_idx]
         last_real = mask[query_len - 1]
-        for row in range(query_len, aligned):
+        for row in range(query_len, aligned[seq_idx]):
             assert torch.equal(mask[row], last_real), (
                 f"seq {seq_idx} padded row {row} does not match its own row {query_len - 1}"
             )
+
+
+@pytest.mark.parametrize(
+    "sliding_window",
+    [pytest.param(None, id="full_attention"), pytest.param(128, id="sliding_window128")],
+)
+def test_per_sequence_masks_match_a_solo_build(default_vllm_config, monkeypatch, sliding_window):
+    """Each sequence's mask must not depend on who else is in its batch."""
+    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,8,64,512")
+    torch.set_default_device("cpu")
+    seq_lens = [(7, 256), (33, 512), (1, 128), (40, 300)]
+    # Headroom for the padded block counts, as a real engine's table has.
+    table_width = _num_blocks_buckets()[-1]
+
+    batched = _padded_mask_metadata(
+        seq_lens, sliding_window=sliding_window, max_num_blocks=table_width
+    )
+    assert sorted(set(batched.aligned_query_lens)) == [1, 8, 64]
+
+    for seq_idx, one in enumerate(seq_lens):
+        solo = _padded_mask_metadata(
+            [one], sliding_window=sliding_window, max_num_blocks=table_width
+        )
+        assert batched.aligned_query_lens[seq_idx] == solo.aligned_query_lens[0]
+        assert torch.equal(_seq_mask(batched, seq_idx), _seq_mask(solo, 0))
 
 
 def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
@@ -1972,15 +2244,16 @@ def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
     torch.set_default_device("cpu")
     seq_lens = [(7, 256), (33, 512)]
     metadata = _padded_mask_metadata(seq_lens)
-    aligned = metadata.aligned_max_query_len
 
     row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
     starts = metadata.query_start_loc[:-1].tolist()
 
     for seq_idx, (query_len, _) in enumerate(seq_lens):
+        aligned = metadata.aligned_query_lens[seq_idx]
         rows = row_tables[seq_idx][:aligned].tolist()
         expected = [starts[seq_idx] + min(q, query_len - 1) for q in range(aligned)]
         assert rows == expected, f"seq {seq_idx} row table {rows} != {expected}"
+        assert row_tables[seq_idx].storage_offset() == 0
 
 
 @pytest.mark.parametrize(
@@ -1996,7 +2269,7 @@ def test_sliding_window_padded_mask_rows_equal_last_real_row(default_vllm_config
     query_len = seq_lens[0][0]
     metadata = _padded_mask_metadata(seq_lens, sliding_window=128)
 
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens[0]
     mask = _seq_mask(metadata, 0)
     last_real = mask[query_len - 1]
     for row in range(query_len, aligned):
@@ -2019,27 +2292,6 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     num_blocks = (kv_len + block_size - 1) // block_size
     assert metadata.active_block_indices is not None
     assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
-
-
-def test_attn_fn_cache_key_is_shape_only(default_vllm_config):
-    """Query lengths in the same bucket must share one compiled kernel."""
-    torch.set_default_device("cpu")
-    impl = SpyreAttentionImpl(
-        num_heads=32,
-        head_size=128,
-        scale=128**-0.5,
-        num_kv_heads=8,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-    )
-
-    impl._get_attn_fn(4, 32, store_mode="index", needs_gather=True)
-    impl._get_attn_fn(4, 32, store_mode="index", needs_gather=True)
-    assert list(impl._attn_fns) == [(4, 32, "index", True)]
-
-    impl._get_attn_fn(4, 64, store_mode="index", needs_gather=True)
-    assert len(impl._attn_fns) == 2
 
 
 def _num_blocks_buckets(block_size: int = 64) -> list[int]:
@@ -2069,7 +2321,8 @@ def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expect
 
     assert metadata.padded_num_blocks == [expected]
     assert len(metadata.attention_mask_tiles[0]) == expected
-    assert metadata.page_index_table_cpu.shape[1] == expected
+    # One table per sequence, sized to that sequence's own active-block count.
+    assert [t.shape[0] for t in metadata.page_index_tables_cpu] == [expected]
 
 
 def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config):

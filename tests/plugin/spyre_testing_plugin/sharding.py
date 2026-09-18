@@ -14,7 +14,7 @@
 
 """Duration-weighted test sharding for CI fan-out.
 
-Each suite (attn/smoke/upstream/dist/probe) is split across N parallel jobs; a job
+Each suite (attn/smoke/upstream/dist/probe/quality) is split across N parallel jobs; a job
 keeps only its shard's slice. Every shard job computes the same weighted greedy
 longest-processing-time partition, so no cross-job coordination is needed and
 the union of all shards is the full selection exactly once (guarded by
@@ -60,7 +60,7 @@ def _will_skip(item: pytest.Item) -> bool:
 def add_shard_options(parser) -> None:
     """Register one --<suite>-shards / --<suite>-shard-id pair per CI suite."""
     group = parser.getgroup("spyre-test-sharding")
-    for suite in ("attn", "smoke", "upstream", "dist", "probe"):
+    for suite in ("attn", "smoke", "upstream", "dist", "probe", "quality"):
         group.addoption(
             f"--{suite}-shards",
             type=int,
@@ -93,6 +93,7 @@ def apply_shards(config: pytest.Config, items: list[pytest.Item]) -> None:
     _apply_upstream_shard(config, items)
     _apply_distributed_shard(config, items)
     _apply_probe_shard(config, items)
+    _apply_quality_shard(config, items)
 
 
 def _load_durations(config: pytest.Config) -> dict[str, float]:
@@ -297,12 +298,17 @@ def _apply_upstream_shard(config: pytest.Config, items: list[pytest.Item]) -> No
     def weight(item: pytest.Item) -> int:
         return 8 if "models/" in item.nodeid else 1
 
+    # The GSM8K evals carry `upstream` but belong to the quality suite (_apply_quality_shard),
+    # so they are deselected here. _apply_shard keeps deselected items in *every* shard, so in
+    # CI it is the Makefile's `not gsm8k` marker expr (never collecting them under this suite)
+    # that actually keeps them out; this select only stops an ad-hoc `pytest -m upstream
+    # --upstream-shards=N` run from executing each eval once per shard.
     _apply_shard(
         config,
         items,
         num_shards=config.getoption("--upstream-shards"),
         shard_id=config.getoption("--upstream-shard-id"),
-        select=lambda item: True,
+        select=lambda item: not item.get_closest_marker("gsm8k"),
         weight=weight,
         label="upstream",
         durations=_load_durations(config),
@@ -348,6 +354,39 @@ def _apply_probe_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
         select=select,
         weight=lambda item: 1,
         label="probe",
+        durations=_load_durations(config),
+    )
+
+
+def _apply_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # The model-output quality gate (Makefile test-quality), split across parallel 1-card
+    # jobs. Two kinds of heavy case share it: the product-model output checks (`model_quality`,
+    # every case compiles a product model up to the 31B decoders) and the GSM8K accuracy evals
+    # (`gsm8k`, each starts a vLLM server and runs a batched eval). Durations balance them;
+    # the static fallback packs the decoders and the server evals as heavy against the much
+    # smaller encoder cases.
+    def select(item: pytest.Item) -> bool:
+        # `not upstream` on the model_quality branch mirrors the Makefile combo and keeps a
+        # future upstream-tagged model_quality test (which the combo would not collect here)
+        # from landing in this partition; the gsm8k evals are the only upstream cases wanted.
+        return (
+            bool(item.get_closest_marker("model_quality"))
+            and not item.get_closest_marker("upstream")
+        ) or bool(item.get_closest_marker("gsm8k"))
+
+    def weight(item: pytest.Item) -> int:
+        if item.get_closest_marker("gsm8k") or "test_model_quality" in item.nodeid:
+            return 8
+        return 1
+
+    _apply_shard(
+        config,
+        items,
+        num_shards=config.getoption("--quality-shards"),
+        shard_id=config.getoption("--quality-shard-id"),
+        select=select,
+        weight=weight,
+        label="quality",
         durations=_load_durations(config),
     )
 

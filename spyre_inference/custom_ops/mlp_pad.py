@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native-path SwiGLU MLP ``intermediate_size`` padding to a stick-aligned width.
+"""Native-path gated MLP ``intermediate_size`` padding to a stick-aligned width.
 
 An ``intermediate_size`` that is not a multiple of the 64-element fp16 stick makes
 ``SiluAndMul`` slice the fused gate+up tensor's second half at an unaligned offset,
@@ -20,12 +20,13 @@ which Spyre inductor cannot lower. ``TorchSpyrePlatform._maybe_pad_intermediate_
 rounds it up to a 64-multiple before the model is built; the pass here zero-fills the
 added gate/up output rows and down_proj input columns as the checkpoint streams in.
 
-Zero-padding is arithmetically inert for SwiGLU (``silu(0) = 0``): unlike QK-norm
-padding, nothing normalizes over ``intermediate_size`` so no rescale is needed, and
-there is no RoPE half-split so plain end-padding (not interleaving) suffices.
+Zero-padding is arithmetically inert for a gated MLP: each added lane has a zero
+up-projection value, so ``activation(0) * 0`` is zero. Unlike QK-norm, nothing normalizes
+over ``intermediate_size`` so no rescale is needed, and there is no RoPE half-split so
+plain end-padding (not interleaving) suffices.
 
-Scope: dense SwiGLU (``gate_proj``/``up_proj``/``down_proj``, fused or separate); MoE
-experts (``moe_intermediate_size``) are out of scope — a fused expert tensor differs.
+Scope: dense gated MLPs (``gate_proj``/``up_proj``/``down_proj``, fused or separate);
+MoE experts (``moe_intermediate_size``) are out of scope — a fused expert tensor differs.
 """
 
 from __future__ import annotations
@@ -52,6 +53,34 @@ def intermediate_padding_active(hf_config) -> bool:
     return original_intermediate_size(hf_config) is not None
 
 
+def supports_intermediate_padding(hf_config) -> bool:
+    """Whether the config uses the gated MLP layout handled by this module.
+
+    Entries must build their dense gated MLP width from ``config.intermediate_size``
+    and load ``gate_proj``/``up_proj``/``down_proj`` weights (fused or separate).
+    Mistral-format ``params.json`` configs use the generic ``transformer`` model type,
+    so their architecture is required as a second discriminator.
+    """
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type in {
+        "gemma4",
+        "gemma4_text",
+        "gemma",
+        "gemma2",
+        "gemma3_text",
+        "granite",
+        "granitemoehybrid",
+        "llama",
+        "ministral3",
+        "mistral",
+        "qwen2",
+        "qwen3",
+    }:
+        return True
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return model_type == "transformer" and "MistralForCausalLM" in architectures
+
+
 def _pad_rows_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
     """Zero-pad the output dim (dim 0) ``[orig, ...] -> [padded, ...]``. gate/up."""
     return F.pad(w, (0,) * (2 * (w.ndim - 1)) + (0, padded - orig))
@@ -62,17 +91,45 @@ def _pad_cols_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
     return F.pad(w, (0, padded - orig))
 
 
-def _pad_weight(name: str, w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
+def width_multipliers(hf_config) -> tuple[int, ...]:
+    """The multiples of ``intermediate_size`` this model's MLPs are built at:
+    Gemma-4's ``use_double_wide_mlp`` doubles the width on its KV-shared layers.
+    """
+    return (1, 2) if getattr(hf_config, "use_double_wide_mlp", False) else (1,)
+
+
+def _pad_weight(
+    name: str,
+    w: torch.Tensor,
+    orig: int,
+    padded: int,
+    multipliers: tuple[int, ...] = (1,),
+) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right end-padding by its name."""
     # Must precede the up_proj test: "gate_up_proj.*" also ends with "up_proj.*".
-    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")) and w.shape[0] == 2 * orig:
-        gate, up = w.chunk(2, dim=0)
-        return torch.cat([_pad_rows_end(gate, orig, padded), _pad_rows_end(up, orig, padded)])
+    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")):
+        for multiplier in multipliers:
+            width = multiplier * orig
+            if w.shape[0] == 2 * width:
+                gate, up = w.chunk(2, dim=0)
+                padded_width = multiplier * padded
+                return torch.cat(
+                    [
+                        _pad_rows_end(gate, width, padded_width),
+                        _pad_rows_end(up, width, padded_width),
+                    ]
+                )
     if name.endswith(("gate_proj.weight", "gate_proj.bias", "up_proj.weight", "up_proj.bias")):
-        return _pad_rows_end(w, orig, padded) if w.shape[0] == orig else w
+        for multiplier in multipliers:
+            width = multiplier * orig
+            if w.shape[0] == width:
+                return _pad_rows_end(w, width, multiplier * padded)
     # down_proj input columns line up with the padded activation lanes.
-    if name.endswith("down_proj.weight") and w.ndim == 2 and w.shape[1] == orig:
-        return _pad_cols_end(w, orig, padded)
+    if name.endswith("down_proj.weight") and w.ndim == 2:
+        for multiplier in multipliers:
+            width = multiplier * orig
+            if w.shape[1] == width:
+                return _pad_cols_end(w, width, multiplier * padded)
     return w
 
 
@@ -88,26 +145,30 @@ def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
     if not intermediate_padding_active(hf_config):
         return
     if not hasattr(model_loader, "get_all_weights"):
-        logger.warning(
-            "MLP padding active but %s has no get_all_weights; weights not padded.",
-            type(model_loader).__name__,
+        load_format = getattr(getattr(model_loader, "load_config", None), "load_format", None)
+        if load_format == "dummy":
+            return
+        raise NotImplementedError(
+            "Spyre MLP intermediate-size padding requires a model loader that "
+            "exposes get_all_weights; "
+            f"{type(model_loader).__name__} (load_format={load_format!r}) is unsupported."
         )
-        return
 
     orig = getattr(hf_config, _ORIG_ATTR)
     padded = hf_config.intermediate_size
+    multipliers = width_multipliers(hf_config)
 
     original_get_all_weights = model_loader.get_all_weights
 
     def padded_get_all_weights(model_config, model) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in original_get_all_weights(model_config, model):
-            yield name, _pad_weight(name, weight, orig, padded)
+            yield name, _pad_weight(name, weight, orig, padded, multipliers)
 
     model_loader.get_all_weights = padded_get_all_weights
 
 
 def verify_padded_intermediate_size(model, hf_config) -> None:
-    """Fail loudly if any SwiGLU MLP was still built at the unpadded width.
+    """Fail loudly if any gated MLP was still built at the unpadded width.
 
     Guards the silent-corruption path: the linear weight loader narrows an
     over-wide tensor to the param width without raising, so a module the config
@@ -117,11 +178,23 @@ def verify_padded_intermediate_size(model, hf_config) -> None:
     if not intermediate_padding_active(hf_config):
         return
     padded = hf_config.intermediate_size
+    widths = {multiplier * padded for multiplier in width_multipliers(hf_config)}
+    found = [
+        (name, getattr(module, "input_size", None))
+        for name, module in model.named_modules()
+        if name.endswith("down_proj")
+    ]
+    if not found:
+        raise RuntimeError(
+            f"Spyre padded MLP intermediate_size to {padded}, but the model has no "
+            "down_proj module, so no MLP was widened: this model's MLP naming is not "
+            "supported by the padding pass."
+        )
     bad = sorted(
         {
-            f"{name}(input_size={module.input_size})"
-            for name, module in model.named_modules()
-            if name.endswith("down_proj") and getattr(module, "input_size", padded) != padded
+            f"{name}(input_size={size})"
+            for name, size in found
+            if size is not None and size not in widths
         }
     )
     if bad:

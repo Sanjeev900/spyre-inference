@@ -282,6 +282,78 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-smoke-shard-7
+          # Model-output quality gate: the product-model output checks (model_quality)
+          # plus the GSM8K accuracy evals (gsm8k). Its own jobs and not in `integration`,
+          # since every case compiles a product model or starts a vLLM server. Sharded
+          # across parallel 1-card jobs like smoke/attention, bounded by the slowest single
+          # case. The plugin owns the weighted partition; QUALITY_SHARDS (Makefile default)
+          # is the count. Adding/removing a shard = add/remove an entry here and bump that
+          # default. (The gsm8k evals need the upstream vLLM checkout; the combo's marker
+          # expression pulls it in automatically, no --upstream flag.)
+          - cfg: Spyre quality gate (shard 1/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-0
+          - cfg: Spyre quality gate (shard 2/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-1
+          - cfg: Spyre quality gate (shard 3/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-2
+          - cfg: Spyre quality gate (shard 4/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-3
+          - cfg: Spyre quality gate (shard 5/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-4
+          - cfg: Spyre quality gate (shard 6/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-5
+          - cfg: Spyre quality gate (shard 7/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-6
+          - cfg: Spyre quality gate (shard 8/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-7
           # Decoder attention, sharded across parallel jobs. The compiled
           # (STOCK on device) cases dominate runtime and grow HBM within a
           # process, so each shard is its own job on its own card: wall-clock
@@ -502,8 +574,9 @@ jobs:
             test_target: test-upstream-distributed
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
-    # the standing image label with the per-PR image label.
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label)) }}
+    # the standing image label with the per-PR image label; on merge_group the
+    # standing label gains the `_mq` suffix to select the merge-queue set.
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label)) }}
     # Don't let one failed config fail this job outright -- test_result decides pass/fail after test_retry gets a shot on a fresh pod.
     continue-on-error: true
     timeout-minutes: 720
@@ -542,6 +615,7 @@ jobs:
             spyre-rpms.lock
             tests/**/*.py
             tests/**/*.yaml
+            tests/data/**
             spyre_inference/**/*.py
             spyre_inference/**/*.yaml
 
@@ -598,8 +672,9 @@ jobs:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
-          # Echo the exact runner-label selectors this job's runs-on used (matrix.runs_on plus the per-PR runner_label override, or the standing matrix.image_label).
-          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
+          test_type: ${{ inputs.test_type }}
+          # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
           is_merge_group: ${{ github.event_name == 'merge_group' }}
@@ -660,7 +735,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.collect_failed_suites.outputs.matrix) }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label)) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label)) }}
     timeout-minutes: 720
     env:
       CI: ''
@@ -681,7 +756,8 @@ jobs:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
-          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
+          test_type: ${{ inputs.test_type }}
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
@@ -838,6 +914,46 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # Test-report fan-in: every leg's JUnit XML into one aggregate report on the run
+  # Summary page -- totals plus a single flat, ctrl+f-searchable row per test case
+  # across all shards (no per-shard rollup, no per-file headings) -- replacing the
+  # per-shard dorny checks the matrix used to publish. Rendered directly from the
+  # JUnit XML by aggregate_junit_summary.py (mirrors the coverage/durations fan-
+  # ins): no dorny, so no check-run to 403 on a fork PR's read-only token, and no
+  # coupling to any external tool's markdown. always()/continue-on-error like the
+  # other fan-ins; no-op when no leg produced a JUnit file.
+  # ---------------------------------------------------------------------------
+  test-report:
+    name: Aggregate test report
+    needs: [test, test_retry]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download JUnit results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      - name: Write aggregate summary
+        run: |
+          shopt -s nullglob
+          files=(junit/*.xml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No JUnit XML to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 .github/scripts/aggregate_junit_summary.py junit/*.xml
+
+  # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
   # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
   # one of the matrix configs above: perf runs benchmarks, not pytest markers,
@@ -910,7 +1026,13 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            uv add --frozen \
+            # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
+            # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
+            # `uv run` reuses the shared venv instead of re-resolving), but uv rejects
+            # UV_NO_SYNC together with `--frozen` on `uv add` ("cannot be used with
+            # --frozen"). Shadow it to a false value for this one call so the add
+            # succeeds; the surrounding UV_NO_SYNC=1 is unchanged for every other uv run.
+            UV_NO_SYNC=0 uv add --frozen \
               "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
             uv sync --verbose --group dev
           else
@@ -929,6 +1051,8 @@ jobs:
           # true -> "1" (bypass uv, use the baked venv's python3 directly),
           # false -> "" (keep the uv path). The Makefile treats empty as "use uv".
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
+          # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
+          SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
         run: |
           echo "Running vLLM benchmark suite (TEST_TYPE=perf)..."
           make tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}" \

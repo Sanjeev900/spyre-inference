@@ -31,8 +31,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
-from spyre_inference.custom_ops.utils import convert
-
 logger = init_logger(__name__)
 
 # vLLM reserves block 0 as `BlockPool.null_block`, so no sequence is ever given its
@@ -46,7 +44,8 @@ class SlotMapping:
     def __init__(self, layers: list[Attention]) -> None:
         self._layers = layers
         self._device: torch.device | None = None
-        self.slots: torch.Tensor | None = None
+        # One tensor, or one per KV head: whatever the impl's KV store indexes by.
+        self.slots: torch.Tensor | list[torch.Tensor] | None = None
 
     def _resolve_device(self) -> torch.device | None:
         if self._device is None:
@@ -61,19 +60,23 @@ class SlotMapping:
                 layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
         return self._device
 
+    def _write_index(self, slot_mapping: torch.Tensor, device: torch.device):
+        """The device-side KV store index in this group's cache layout."""
+        return self._layers[0].impl.kv_write_index(slot_mapping, device)  # ty: ignore[possibly-missing-attribute]
+
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = convert(slot_mapping.clamp(min=_NULL_SLOT), device=device)
+        self.slots = self._write_index(slot_mapping.clamp(min=_NULL_SLOT), device)
 
     def publish_null(self, num_tokens: int) -> None:
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = convert(
-            torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), device=device
+        self.slots = self._write_index(
+            torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), device
         )
 
 
@@ -119,14 +122,27 @@ def _spyre_attention_forward(
         # invisible because the op reaches its cache through the forward context.
         dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
 
+    # Staged here, not in the impl: the copies are then traced into the block
+    # graph, which warmup already compiles at every token bucket.
+    staging = getattr(self.impl, "staging_buffers", None)
+    buffers = staging(query.device) if staging is not None else None
+    rows = query.shape[0]
+    if buffers is None:
+        q_in, out_buf = query, output
+    else:
+        q_in, out_buf = buffers
+        q_in[:rows] = query
+
     torch.ops.vllm.unified_attention_with_output(
-        query,  # ty: ignore[invalid-argument-type]
+        q_in,  # ty: ignore[invalid-argument-type]
         key,  # ty: ignore[invalid-argument-type]
         value,  # ty: ignore[invalid-argument-type]
-        output,  # ty: ignore[invalid-argument-type]
+        out_buf,  # ty: ignore[invalid-argument-type]
         _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
         kv_cache_dummy_dep=dep,  # ty: ignore[invalid-argument-type]
     )
+    if buffers is not None:
+        output.copy_(out_buf[:rows])
     return output.view(-1, hidden_size)
 
 

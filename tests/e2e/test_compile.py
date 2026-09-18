@@ -30,6 +30,7 @@ import torch.nn.functional as F
 pytestmark = pytest.mark.uses_subprocess
 
 _POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
+_TRANSFORMERS_ENCODER_MODEL = "ibm-granite/granite-embedding-278m-multilingual"
 _POOLING_REFS = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _COSINE_MIN = 0.99
 
@@ -48,6 +49,10 @@ _COSINE_MIN = 0.99
         (
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
+        ),
+        (
+            "google/gemma-4-26B-A4B",
+            "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
         ),
     ],
 )
@@ -105,7 +110,64 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
         assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
-def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compile the Transformers backend and check against a known reference.
+
+    Guards the Spyre-safe attention forward (transpose + contiguous + reshape)
+    against the silent data corruption that the unfused view chain caused.
+    """
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "\n\nIBMs main businesses are the companies that provide the services of the",
+        monkeypatch,
+        model_impl="transformers",
+    )
+
+
+def test_transformers_backend_encoder_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compiled ``model_impl="transformers"`` encoder embedding matches cached HF refs.
+
+    Exercises the whole-model ``torch.compile`` path taken by
+    ``SpyreTransformersEmbeddingModel``: encoder-only models have no repeated
+    ``Attention`` block list, so ``_compile_for_spyre`` compiles the full graph
+    in one shot.  Verifies that the XLM-RoBERTa gather-free embedding patch and
+    RoPE cache survive compilation and produce correct output.
+    """
+    from vllm import LLM
+
+    refs = json.loads(_POOLING_REFS.read_text())[_TRANSFORMERS_ENCODER_MODEL]
+    prompts = refs["prompts"]
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    engine = LLM(
+        model=_TRANSFORMERS_ENCODER_MODEL,
+        runner="pooling",
+        model_impl="transformers",
+        enforce_eager=False,
+        max_model_len=64,
+        max_num_seqs=2,
+    )
+    outputs = engine.embed(prompts)
+    assert len(outputs) == len(prompts)
+    for out, ref_emb in zip(outputs, refs["embeddings"]):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb)
+        assert all(math.isfinite(x) for x in emb)
+        sim = F.cosine_similarity(
+            torch.tensor(emb, dtype=torch.float32),
+            torch.tensor(ref_emb, dtype=torch.float32),
+            dim=0,
+        ).item()
+        assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
+
+
+def _assert_compiled_output(
+    model: str,
+    ref_output: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_impl: str | None = None,
+) -> None:
     from vllm import LLM, SamplingParams
     from vllm.config import CompilationConfig
 
@@ -113,7 +175,7 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
 
     prompt = "What are IBMs main businesses?"
 
-    engine = LLM(
+    kwargs: dict = dict(
         model=model,
         enforce_eager=False,
         max_model_len=128,
@@ -121,6 +183,10 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
         max_num_batched_tokens=8,
         compilation_config=CompilationConfig(compile_sizes=[1, 8]),
     )
+    if model_impl is not None:
+        kwargs["model_impl"] = model_impl
+
+    engine = LLM(**kwargs)
 
     output = engine.generate(
         prompt,

@@ -57,6 +57,63 @@ def test_native_all_reduce_works(run_tp_probe) -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
+def test_all_reduce_vision_flattened_is_exact(run_tp_probe) -> None:
+    """Does the flatten workaround return the right values, not just compile?"""
+    run_tp_probe("all_reduce_vision_flattened", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
+    """Padding a collective inside a compiled graph, alongside unpadded controls.
+
+    Was xfail(strict=True) for returning garbage while eager was bit-exact; fixed in the
+    torch-spyre f4f0bcc..9f975a3 range. The host-side pad in `embed_input_ids` still stays
+    for bucketing -- this only unlocks moving it inside the compiled region.
+    """
+    run_tp_probe("compiled_all_reduce_padded", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "deeptools' L3 scheduler asserts 'Expect valid lower and upper bound "
+        "parameters' building the collective's sum kernel for a rank-3 "
+        "[1, 528, 1024] fp16 all_reduce; [1, 3120, 1024] builds. When this passes, "
+        "drop the flatten from SpyreCommunicator.all_reduce."
+    ),
+)
+def test_all_reduce_vision_rank3_works(run_tp_probe) -> None:
+    run_tp_probe("all_reduce_vision_rank3", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_all_reduce_hidden5120_decode_works(run_tp_probe) -> None:
+    """The decode shape at hidden 5120, eager: compiled lowers to a different op."""
+    run_tp_probe("all_reduce_hidden5120_decode", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(

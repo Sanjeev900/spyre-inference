@@ -58,6 +58,7 @@ XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import os
 import re
@@ -67,6 +68,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import traceback
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,7 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
+from spyre_testing_plugin.tags import result_tags
 from spyre_testing_plugin.vfio_reaper import (
     reap_vfio_holders,
     spyre_hardware_present,
@@ -214,6 +217,7 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                 rel_path=file_entry["rel_path"],
                 allow_list=tuple(allow_list),
                 block_list=tuple(block_list),
+                config_list=file_entry.get("config_list"),
             )
         )
     return UpstreamTestConfig(files=tuple(files))
@@ -523,6 +527,11 @@ def pytest_configure(config):
     # Set env vars BEFORE any vllm imports
     os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+    # Let a shutting-down worker take longer to release the VFIO card: the default
+    # 5s can expire mid-teardown (e.g. finishing a Spyre compile), leaving the card
+    # busy for the next test. Governs both the executor worker-exit wait and the
+    # engine process-manager join.
+    os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30")
 
     # Load plugins early to register custom ops before test modules import RMSNorm
     from vllm.plugins import load_general_plugins
@@ -653,6 +662,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
             item.add_marker(upstream_marker)
 
+            # Tag upstream items here (the conftest fixture binds only under
+            # tests/). Before the skip/xfail branches so a tag lands regardless
+            # of the item's eventual disposition.
+            params = getattr(getattr(item, "callspec", None), "params", {})
+            for name, value in result_tags(params):
+                item.user_properties.append((name, value))
+
             fc = _find_file_config(test_path, file_configs)
             if fc is None:
                 item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
@@ -758,6 +774,18 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     fc = _find_file_config(test_path, file_configs)
     if not fc:
         return
+
+    # Tests parametrized by an upstream `config_filename` fixture (e.g. gsm8k evals)
+    # aren't reachable via param_overrides, which only rewrites the test's own
+    # parametrize markers. Instead, point the upstream conftest's --config-list-file at
+    # a Spyre-owned list; its own (later-running) pytest_generate_tests then parametrizes
+    # config_filename from our configs. tryfirst here guarantees we set it first.
+    # config_list_file is session-global; this is set once and deliberately not restored,
+    # since the only config_filename consumer in the pinned upstream tree is this gsm8k file
+    # (test_gsm8k_offloading parametrizes on its own cfg), so there is nothing else to leak to.
+    if fc.config_list and "config_filename" in metafunc.fixturenames:
+        list_path = (_YAML_PATH.parent / fc.config_list).resolve()
+        metafunc.config.option.config_list_file = str(list_path)
 
     test_name = metafunc.definition.originalname or metafunc.definition.name
     allow_entry = _find_allow_entry(test_name, fc.allow_list)
@@ -1033,6 +1061,23 @@ def inference_mode():
 
 
 @pytest.fixture()
+def register_ministral_14b(request, monkeypatch):
+    """Make `mistralai/Ministral-3-14B-Instruct-2512-BF16` resolvable upstream.
+
+    Upstream's registry only knows the 3B, and `find_hf_info` raises for unknown ids,
+    so register the 14B as another extra on the same architecture entry. `setitem`
+    because `_HfExamplesInfo` is frozen — the `extras` dict is not.
+    """
+    hf_models = request.node.module.HF_EXAMPLE_MODELS.hf_models
+    info = hf_models["PixtralForConditionalGeneration"]
+    monkeypatch.setitem(
+        info.extras,
+        "ministral-3-14b",
+        "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    )
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 
@@ -1088,9 +1133,7 @@ def patch_backend_list(request, monkeypatch):
                 # The KV write needs the slot-outermost layout, not the default.
                 if blocks.device.type != "spyre":
                     return blocks
-                from spyre_inference.v1.attention.backends.spyre_attn import (
-                    slot_major_kv_layout,
-                )
+                from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
                 nb, bs, nkvh, hs = blocks.shape
                 return blocks.cpu().to(
@@ -1145,21 +1188,18 @@ def pytest_fixture_setup(fixturedef, request):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Flag subprocess tests whose teardown must reap the card, not just wait.
+    """Flag every `uses_subprocess` test's teardown to reap the card, not just wait.
 
-    Only a `uses_subprocess` test can orphan a worker (EngineCore, TP rank) still
-    holding the VFIO fd, which a bare wait would never free. A strict-xfail probe
-    that fails in its subprocess reports as `xfailed` (wasxfail set), not `failed`,
-    so reap on either -- but gate on the marker: `wasxfail` alone also fires on the
-    upstream YAML's widespread `xfail(strict=False)`, where reaping would SIGKILL a
-    live card holder instead of waiting for a clean release. The reap excludes the
-    main pytest process (see teardown).
+    Only a subprocess test can orphan a worker (EngineCore, TP rank) still holding
+    the VFIO fd -- on failure, but also on a pass, when a worker outlives vLLM's
+    shutdown grace period and lingers on the card as the engine force-kills its
+    parent. `wait_until_card_free` cannot free a still-alive holder; only a SIGKILL
+    can. So reap on the marker alone, regardless of outcome -- a safe gate, since
+    subprocess tests keep the main pytest process (which the reap excludes) off the
+    card.
     """
-    outcome = yield
-    report = outcome.get_result()
-    if not any(m.name == "uses_subprocess" for m in item.iter_markers()):
-        return
-    if report.failed or getattr(report, "wasxfail", None) is not None:
+    yield
+    if any(m.name == "uses_subprocess" for m in item.iter_markers()):
         item._spyre_reap_card = True
 
 
@@ -1167,18 +1207,15 @@ def pytest_runtest_makereport(item, call):
 def pytest_runtest_teardown(item, nextitem):
     """Free the Spyre card at each test boundary on a Spyre host.
 
-    A failed or xfailed test can orphan a subprocess holder outright, so
-    afterwards we reap (SIGKILL the holder, then wait for the card). The reap
-    excludes the main pytest pid, so it cannot recover a card the main process
-    opened in-process -- uses_subprocess tests must keep off the card (guard on
-    spyre_device_count, never spyre_available) so no subprocess is blocked.
+    A `uses_subprocess` test (flagged above) can orphan a subprocess holder, so we
+    reap: SIGKILL the holder, then wait for the card. The reap excludes the main
+    pytest pid, so it cannot recover a card the main process opened in-process --
+    uses_subprocess tests must keep off the card (guard on spyre_device_count,
+    never spyre_available) so no subprocess is blocked.
 
-    A *passing* test can also leave the card transiently busy: an out-of-process
-    vLLM engine is force-killed during shutdown and the kernel's VFIO release is
-    asynchronous, so the holder is already on its way out but may not be gone by
-    the time the next test opens the device. There we only wait — killing would
-    take down a legitimately cached `LLM`, or the in-process device tests whose
-    card belongs to the still-alive pytest process.
+    Every other test only waits: the card may be transiently busy (an in-process
+    device test whose card belongs to the still-alive pytest process, or a cached
+    `LLM`), and killing there would take down a legitimate holder.
 
     `trylast` runs this after all other teardown (fixture finalizers, the tests'
     own `del llm`).
@@ -1198,3 +1235,33 @@ def pytest_runtest_logreport(report) -> None:
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     sharding.write_durations(_log)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_cmdline_main(config):
+    """Hard-exit a Spyre-host run before interpreter finalization.
+
+    senlib's config singleton is torn down from a libc exit handler after
+    pytest has already reported, and that destructor intermittently aborts
+    ("corrupted double-linked list"), failing an otherwise-green job. os._exit
+    skips it. Remove once senlib no longer aborts at process exit.
+    """
+    outcome = yield
+    if not spyre_hardware_present():
+        return
+    result = outcome.get_result()
+    code = int(result) if result is not None else 0
+    _log(
+        f"Spyre host: hard-exiting (code {code}) past finalization "
+        "to skip the senlib teardown abort"
+    )
+    try:
+        # os._exit skips every atexit handler; run them now so coverage saves,
+        # logging flushes and multiprocessing reaps children. Only the libc
+        # handler where the abort lives is left to be skipped.
+        atexit._run_exitfuncs()
+    except Exception:
+        _log(f"atexit handlers failed before hard-exit:\n{traceback.format_exc()}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
