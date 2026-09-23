@@ -592,6 +592,12 @@ class TorchSpyrePlatform(CpuPlatform):
             # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
             cls._maybe_pad_intermediate_size(vllm_config)
 
+            # Spyre has no fp32 batchmatmul (torch-spyre#1794). Pooling models
+            # default head_dtype to fp32; override to model dtype (fp16) so
+            # classification heads stay on device.
+            if vllm_config.model_config.runner_type == "pooling":
+                vllm_config.model_config.hf_config.head_dtype = "model"
+
         parallel_config = vllm_config.parallel_config
 
         # Spyre does not currently support data parallelism. The worker's

@@ -59,6 +59,17 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-large",
 ]
 
+# Sequence classifiers via native vLLM model class (DistilBertForSequenceClassification).
+# id2label for distilbert-base-uncased-finetuned-sst-2-english: {0: NEGATIVE, 1: POSITIVE}
+CLASSIFY_MODEL = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+CLASSIFY_PROMPTS = [
+    "This movie is great!",
+    "This movie is terrible!",
+]
+# HF fp32 reference (cpu): great→POSITIVE≈0.9999, terrible→NEGATIVE≈0.9997.
+# Minimum probability for the correct class to catch near-uniform wrong results.
+CLASSIFY_MIN_CORRECT_PROB = 0.9
+
 # Token classification: the model applies its own classifier after casting to
 # head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
 # runs on Spyre instead of detouring through SpyreCpuClassifier.
@@ -330,3 +341,62 @@ def test_encoder_token_classify() -> None:
             f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
         )
         assert (got - ref).abs().max().item() < 1e-2, f"{prompt!r}: scores drifted from HF"
+
+
+@pytest.mark.uses_subprocess
+def test_distilbert_classify() -> None:
+    """Native DistilBertForSequenceClassification: probs match HF fp32 reference.
+
+    Validates that the upstream native vLLM model class for DistilBERT produces
+    correct classification outputs without --model-impl transformers and without
+    any spyre-inference workarounds (_stamp_layer_idx, _PreClassifierHead,
+    pre_classifier registration).
+
+    Runs an inline HF CPU reference to obtain fp32 logits, then compares Spyre
+    softmax probabilities within fp16 tolerance (atol=0.01).
+    Also asserts correct sentiment direction so a broken head (e.g. missing
+    pre_classifier → near-uniform [0.51, 0.49]) fails even if probs are finite.
+    """
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(CLASSIFY_MODEL)
+    hf = AutoModelForSequenceClassification.from_pretrained(CLASSIFY_MODEL, dtype=torch.float32)
+    hf.eval()
+    with torch.inference_mode():
+        enc = tok(
+            CLASSIFY_PROMPTS,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        )
+        ref_probs = F.softmax(hf(**enc).logits.float(), dim=-1)  # [N, num_labels]
+
+    llm = LLM(
+        model=CLASSIFY_MODEL,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=len(CLASSIFY_PROMPTS),
+        enforce_eager=True,
+    )
+    outputs = llm.classify(CLASSIFY_PROMPTS)
+    assert len(outputs) == len(CLASSIFY_PROMPTS)
+
+    for i, (out, ref) in enumerate(zip(outputs, ref_probs)):
+        probs = torch.tensor(out.outputs.probs, dtype=torch.float32)
+        assert probs.shape == ref.shape
+        assert all(math.isfinite(p) for p in probs.tolist())
+        assert abs(probs.sum().item() - 1.0) < 1e-3
+        assert torch.allclose(probs, ref, atol=1e-2), (
+            f"prompt {i}: Spyre probs {probs.tolist()} vs HF {ref.tolist()}"
+        )
+
+    # Explicit sentiment-direction check: {0: NEGATIVE, 1: POSITIVE}
+    great_probs = outputs[0].outputs.probs
+    terrible_probs = outputs[1].outputs.probs
+    assert great_probs[1] >= CLASSIFY_MIN_CORRECT_PROB, (
+        f"'great' POSITIVE={great_probs[1]:.4f} < {CLASSIFY_MIN_CORRECT_PROB}"
+    )
+    assert terrible_probs[0] >= CLASSIFY_MIN_CORRECT_PROB, (
+        f"'terrible' NEGATIVE={terrible_probs[0]:.4f} < {CLASSIFY_MIN_CORRECT_PROB}"
+    )

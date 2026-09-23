@@ -1376,7 +1376,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         dtype = self.model_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 
-    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes, **kwargs):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages), in the shape and
