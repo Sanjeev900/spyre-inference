@@ -126,7 +126,7 @@ USE_SPYRE_PROFILER = "0"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
+  { git = "https://github.com/Sanjeev900/vllm", rev = "feature/distilbert-native-model" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "c36230e67f08fa1278a4761baab5e8c8a2fa1307" }
 torch = [

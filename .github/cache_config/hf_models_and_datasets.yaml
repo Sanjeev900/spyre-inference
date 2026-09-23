@@ -34,6 +34,7 @@ public_models:
     revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
   - repo: BAAI/bge-reranker-large
     revision: 55611d7bca2a7133960a6d3b71e083071bbfc312
+  - distilbert/distilbert-base-uncased-finetuned-sst-2-english
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b
   - repo: ibm-granite/granite-3.3-8b-instruct
