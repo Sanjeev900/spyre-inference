@@ -73,8 +73,16 @@ def test_wrapper_recursively_converts_integer_inputs(monkeypatch):
     assert out["positions"][0].dtype == torch.int64
 
 
-def test_wrapper_recursively_converts_outputs_to_cpu(monkeypatch):
-    """The same tree conversion serves model outputs and multimodal inputs."""
+def test_wrapper_keeps_outputs_on_device(monkeypatch):
+    """__call__ no longer D2Hs model outputs.
+
+    Previously the wrapper copied the full hidden-state tensor to CPU after every
+    forward pass so that upstream could do hidden_states[logits_indices] on CPU.
+    That caused a host::synchronize stall on the entire [batch, hidden] tensor —
+    91% of total profiler wall time on Gemma-4 bs=8. The index is now done on
+    Spyre via select_rows in our execute_model override, so __call__ must not D2H.
+    Only the H2D for integer inputs should be recorded here.
+    """
     seen: list[object] = []
 
     def fake_convert(t, device=None, dtype=None):
@@ -90,7 +98,8 @@ def test_wrapper_recursively_converts_outputs_to_cpu(monkeypatch):
     wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("spyre"), model_dtype=torch.float16)
     wrapper(input_ids=torch.tensor([1], dtype=torch.int64))
 
-    assert seen == [torch.device("spyre"), "cpu"]
+    # Only the H2D for integer inputs — no D2H of the output.
+    assert seen == [torch.device("spyre")]
 
 
 def test_wrapper_casts_multimodal_floats_to_the_model_dtype(monkeypatch):
