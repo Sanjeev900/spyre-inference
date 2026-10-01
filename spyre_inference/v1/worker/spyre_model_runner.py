@@ -41,7 +41,8 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import contextmanager
-from typing import Any, cast
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -50,7 +51,8 @@ import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
+from vllm.distributed import get_pp_group, get_tp_group
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
@@ -59,7 +61,9 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     KVConnectorOutput,
     ModelRunnerOutput,
@@ -67,8 +71,24 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import (
+    ExecuteModelState,
+    GPUModelRunner,
+    IntermediateTensors,
+    get_ec_transfer,
+    get_kv_transfer_group,
+    has_ec_transfer,
+    has_kv_transfer_group,
+    is_residual_scattered_for_sp,
+    make_empty_encoder_model_runner_output,
+    maybe_create_ubatch_slices,
+    record_function_or_nullcontext,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
@@ -390,7 +410,11 @@ class _SpyreModelWrapper:
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
-        # Pooling: keep on Spyre. Generative: D2H for sampling.
+        # Hidden states remain on Spyre for all model types during live serving
+        # (_keep_outputs_on_device=True). The row index is done on Spyre via select_rows
+        # in our execute_model override. During warmup, _dummy_run temporarily sets
+        # _keep_outputs_on_device=False so upstream GPUModelRunner._dummy_run gets CPU
+        # hidden states for its index.
         if not self._keep_outputs_on_device:
             result = convert_tensor_tree(result, device="cpu")
 
@@ -407,28 +431,37 @@ class _SpyreModelWrapper:
         return convert(t, device="cpu") if isinstance(t, torch.Tensor) else t
 
     def compute_logits(self, hidden_states, *args, **kwargs):
-        """Move hidden_states onto Spyre for the lm_head custom op.
+        """Run the lm_head projection on Spyre and return CPU logits.
 
-        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
-        `select_rows`), so the tensor handed to compute_logits is on CPU;
-        move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        hidden_states arrives already on Spyre: our execute_model override uses
+        select_rows (torch.index_select) to gather the active rows on-device before
+        calling here, so no H2D is needed. Previously a full D2H of the whole
+        [batch, hidden] tensor was done in __call__ and this method re-uploaded
+        the sliced rows; that round-trip was the 91% host::synchronize stall.
 
-        The sampled-row count is not body-bucket padded, so padding it onto the warmed
-        row buckets keeps the projection on shapes warmup compiled.
+        The sampled-row count is not body-bucket padded, so padding it onto the
+        warmed row buckets keeps the lm_head projection on compiled shapes.
+
+        Logits are returned on CPU: SpyreParallelLMHead keeps them on Spyre for
+        the TP all_gather, and SpyreLogitsProcessor._gather_logits converts to
+        CPU right after, so downstream sampling always gets CPU logits.
         """
         num_rows = hidden_states.shape[0]
         buckets = self._logits_row_buckets
         idx = bisect.bisect_left(buckets, num_rows)
         padded_rows = buckets[idx] if idx < len(buckets) else num_rows
         if padded_rows != num_rows:
-            hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
+            # Padding is rare (only when num_rows misses every warmed bucket).
+            # F.pad (aten::constant_pad_nd) on a Spyre tensor is unverified, so
+            # round-trip through CPU for the pad only. The common no-pad path
+            # (exact bucket hit, e.g. bs=8 with bucket [8]) stays on Spyre.
+            hidden_states = F.pad(
+                convert(hidden_states, device="cpu"),
+                (0, 0, 0, padded_rows - num_rows),
+            )
+            hidden_states = convert(hidden_states, device=self._spyre_device)
 
-        hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
+        # hidden_states is on Spyre — no H2D needed.
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -689,12 +722,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = self._create_shape_bucketer()
 
-        # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
+        # Generative models keep outputs on Spyre — the logits_indices gather is now
+        # done on-device via select_rows in our execute_model override, so no D2H is
+        # needed from __call__. Pooling models respect configure_pooling_for_spyre:
+        # some poolers (MEAN, unsupported heads) explicitly need CPU outputs and set
+        # _pooling_on_spyre=False, so we must not force them on-device.
         bucketer = self.spyre_shape_bucketer
+        is_generative = self.model_config.runner_type != "pooling"
         self.model = _SpyreModelWrapper(
             self.model,
             self._spyre_device,
-            keep_outputs_on_device=self._pooling_on_spyre,
+            keep_outputs_on_device=True if is_generative else self._pooling_on_spyre,
             logits_row_buckets=(
                 []
                 if bucketer is None
@@ -1280,7 +1318,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
-        """Force D2H during dummy forward (upstream logits index is CPU).
+        """Warmup forward pass with forced D2H so upstream can run its CPU index.
+
+        During warmup, upstream GPUModelRunner._dummy_run calls the model and then
+        does hidden_states[logits_indices] on CPU — the same fancy index our real
+        execute_model override replaces with select_rows. _dummy_run does not go
+        through our execute_model override, so it still needs a CPU tensor. We
+        temporarily flip _keep_outputs_on_device=False to get the D2H, then
+        restore it. This only fires during warmup, never during live serving.
 
         Pooling must pass ``force_attention=True``. Upstream skips attention
         metadata unless that flag or a FULL cudagraph is set; encoder impl
@@ -1697,6 +1742,327 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._sync_device()
         return model_runner_output
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        """Execute model on Spyre.
+
+        Overrides upstream GPUModelRunner.execute_model to replace Python fancy
+        indexing (hidden_states[logits_indices], which calls unsupported
+        aten::index.Tensor on Spyre) with select_rows (torch.index_select).
+        """
+        if self.execute_model_state is not None:
+            raise RuntimeError(
+                "State error: sample_tokens() must be called "
+                "after execute_model() returns None."
+            )
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_ngram_gpu()
+        ):
+            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
+            spec_decode_tokens_copy = (
+                scheduler_output.scheduled_spec_decode_tokens.copy()
+            )
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
+
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            assert kv_connector_metadata is not None
+            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        with (
+            record_function_or_nullcontext("gpu_model_runner: preprocess"),
+            self.synchronize_input_prep(),
+        ):
+            deferred_state_corrections_fn = self._update_states(scheduler_output)
+
+            if has_ec_transfer() and not get_ec_transfer().is_consumer:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                    return make_empty_encoder_model_runner_output(scheduler_output)
+
+            if not num_scheduled_tokens:
+                if (
+                    self.parallel_config.distributed_executor_backend
+                    == "external_launcher"
+                    and self.parallel_config.data_parallel_size > 1
+                ):
+                    self._dummy_run(1)
+                if not has_kv_transfer_group():
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+
+            if self.cache_config.kv_sharing_fast_prefill:
+                assert not self.num_prompt_logprobs, (
+                    "--kv-sharing-fast-prefill produces incorrect "
+                    "logprobs for prompt tokens, tokens, please disable "
+                    "it when the requests need prompt logprobs"
+                )
+
+            num_reqs = self.input_batch.num_reqs
+            req_ids = self.input_batch.req_ids
+            tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+            max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
+                self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+            )
+
+            cascade_attn_prefix_lens = None
+            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
+                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                    num_scheduled_tokens_np,
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    scheduler_output.num_common_prefix_blocks,
+                )
+
+            (
+                cudagraph_mode,
+                batch_desc,
+                should_ubatch,
+                num_tokens_across_dp,
+                cudagraph_stats,
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens=num_tokens_unpadded,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                use_cascade_attn=cascade_attn_prefix_lens is not None,
+                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                allow_microbatching=self._allow_microbatching(
+                    num_reqs, num_scheduled_tokens_np
+                ),
+            )
+
+            logger.debug(
+                "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                "should_ubatch: %s, num_tokens_across_dp: %s",
+                cudagraph_mode,
+                batch_desc,
+                should_ubatch,
+                num_tokens_across_dp,
+            )
+
+            num_tokens_padded = batch_desc.num_tokens
+            num_reqs_padded = (
+                batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            )
+            ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                should_ubatch,
+                num_scheduled_tokens_np,
+                num_tokens_padded,
+                num_reqs_padded,
+                self.parallel_config.num_ubatches,
+            )
+
+            has_separate_kv_update = not all(
+                all(
+                    g.backend.forward_includes_kv_cache_update
+                    for g in self.attn_groups[id]
+                )
+                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
+            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+            if self.cache_config.mamba_cache_mode == "align":
+                if deferred_state_corrections_fn:
+                    deferred_state_corrections_fn()
+                    deferred_state_corrections_fn = None
+                mamba_bufs = self._get_mamba_bufs()
+                mamba_utils.preprocess_mamba(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.cache_config,
+                    self.mamba_state_idx,
+                    self.input_batch,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                    self.model.get_mamba_state_copy_func(),
+                    mamba_bufs.preprocess,
+                    align_ctx=mamba_bufs.postprocess_align,
+                )
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                )
+                self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+                if mamba_bufs.postprocess_align is not None:
+                    mamba_utils.stage_postprocess_inputs_to_gpu(
+                        mamba_bufs.postprocess_align,
+                        scheduler_output,
+                        self.input_batch.req_ids,
+                        num_reqs,
+                        self.requests,
+                        self.mamba_state_idx,
+                    )
+
+            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded
+                if pad_attn or has_separate_kv_update
+                else num_tokens_unpadded,
+                num_reqs_padded=(
+                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+                ),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+
+            attn_metadata, spec_decode_common_attn_metadata = (
+                self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    max_num_sampled_tokens=max_num_sampled_tokens,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
+                )
+            )
+
+            (
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+                ec_connector_output,
+            ) = self._preprocess(
+                scheduler_output, num_tokens_padded, intermediate_tensors
+            )
+
+        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+        has_encoder_input = (
+            self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        )
+
+        defer_kv_connector_finalize = self.speculative_config is not None
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(
+                self.model_config,
+                num_tokens_unpadded,
+                ubatch_slices_padded,
+            )
+        with (
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,
+                skip_compiled=has_encoder_input,
+            ),
+            record_function_or_nullcontext("gpu_model_runner: forward"),
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
+            ) as kv_connector_output,
+        ):
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+
+        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
+            else:
+                hidden_states = model_output
+                aux_hidden_states = None
+
+            if not self.broadcast_pp_output:
+                if not get_pp_group().is_last_rank:
+                    assert isinstance(hidden_states, IntermediateTensors)
+                    self.kv_connector_output = kv_connector_output
+                    return hidden_states
+
+                if self.is_pooling_model:
+                    return self._pool(
+                        hidden_states,
+                        num_scheduled_tokens,
+                        num_scheduled_tokens_np,
+                        kv_connector_output,
+                    )
+
+                sample_hidden_states = select_rows(hidden_states, logits_indices)
+                logits = self.model.compute_logits(sample_hidden_states)
+            else:
+                assert not self.is_pooling_model
+
+                sample_hidden_states = select_rows(hidden_states, logits_indices)
+                if not get_pp_group().is_last_rank:
+                    all_gather_tensors = {
+                        "residual": not is_residual_scattered_for_sp(
+                            self.vllm_config, num_tokens_padded
+                        )
+                    }
+                    get_pp_group().send_tensor_dict(
+                        hidden_states.tensors,
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+                    logits = None
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+
+                model_output_broadcast_data: dict[str, Any] = {}
+                if logits is not None:
+                    model_output_broadcast_data["logits"] = logits.contiguous()
+
+                broadcasted = get_pp_group().broadcast_tensor_dict(
+                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                )
+                assert broadcasted is not None
+                logits = broadcasted["logits"]
+
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output,
+            logits,
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            ec_connector_output,
+            cudagraph_stats,
+            slot_mappings,
+        )
+        self.kv_connector_output = kv_connector_output
+
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+
+        return None
 
     # --- KV cache allocation ---
 
