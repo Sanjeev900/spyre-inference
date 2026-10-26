@@ -310,83 +310,73 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
 
 
-class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
-    """Transformers-backend embedding model with Spyre-specific embedding patches.
+class _SpyreTokenTypeIdsMixin:
+    """Mixin for Transformers-backend models whose underlying HF model uses the
+    BERT/RoBERTa ``torch.gather`` pattern to derive ``token_type_ids``.
 
-    HuggingFace's RoBERTa / XLM-RoBERTa embedding forward uses ``torch.gather`` to
-    slice a pre-built ``token_type_ids`` buffer using ``position_ids`` as an index.
-    That buffer is always all-zeros, so the gather produces all-zeros regardless of
-    the index — mathematically a no-op — but ``aten::gather.out`` is not implemented
-    in torch-spyre, so it crashes the moment ``position_ids`` is on device.
+    HuggingFace's BERT / RoBERTa / XLM-RoBERTa embedding forward registers a
+    ``[1, max_position_embeddings]`` all-zeros buffer called ``token_type_ids``
+    and, when no ``token_type_ids`` kwarg is passed, uses ``torch.gather`` on
+    that buffer to derive segment ids from ``position_ids``.  The output is
+    always all-zeros (the buffer is zero), but ``aten::gather.out`` is not
+    implemented in torch-spyre and crashes as soon as ``position_ids`` is on
+    device.
 
-    ``_patch_roberta_embeddings`` replaces the forward of any HF embedding submodule
-    that carries this buffer pattern with one that passes ``token_type_ids`` as an
-    explicit all-zeros tensor, bypassing the gather entirely.
+    vLLM's ``Base.forward`` never passes ``token_type_ids`` to the HF model,
+    so the gather branch always fires.  This mixin overrides ``forward`` to
+    inject an explicit all-zeros ``token_type_ids`` kwarg whenever the HF
+    embedding module has that buffer, bypassing the gather entirely.  The
+    check is a no-op for any model whose embedding module does not carry the
+    buffer (decoders, RoPE encoders, etc.).
     """
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
-        self._patch_roberta_embeddings()
-        return result
-
-    def _patch_roberta_embeddings(self) -> None:
-        """Replace the gather-based token_type_ids path in HF RoBERTa embeddings.
-
-        Detects any submodule that holds the ``token_type_ids`` registered buffer
-        (a ``[1, max_position_embeddings]`` all-zeros int64 tensor that HF RoBERTa
-        creates in its ``__init__``) and has a ``word_embeddings`` attribute (the
-        BERT/RoBERTa embedding table).  Replaces its ``forward`` with a wrapper that
-        supplies an explicit all-zeros ``token_type_ids`` so the HF code never enters
-        the ``torch.gather`` branch.
-        """
-        patched = 0
-        for module in self.model.modules():
-            buf = getattr(module, "token_type_ids", None)
-            if not isinstance(buf, torch.Tensor) or buf.dim() != 2:
-                continue
-            if not hasattr(module, "word_embeddings"):
-                continue
-
-            original_forward = module.forward
-
-            def _patched_forward(
-                input_ids: torch.Tensor | None = None,
-                token_type_ids: torch.Tensor | None = None,
-                position_ids: torch.Tensor | None = None,
-                inputs_embeds: torch.Tensor | None = None,
-                past_key_values_length: int = 0,
-                *,
-                _orig=original_forward,
-            ) -> torch.Tensor:
-                # Supply explicit zeros so HF skips the gather on the internal buffer.
-                # The buffer is all-zeros by construction, so this is identical output.
-                if token_type_ids is None:
-                    ref = input_ids if input_ids is not None else inputs_embeds
-                    if ref is not None:
-                        token_type_ids = torch.zeros(ref.shape[:2], dtype=torch.long, device=ref.device)
-                return _orig(
-                    input_ids=input_ids,
-                    token_type_ids=token_type_ids,
-                    position_ids=position_ids,
-                    inputs_embeds=inputs_embeds,
-                    past_key_values_length=past_key_values_length,
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        embeddings = getattr(self.model, "embeddings", None)
+        if (
+            embeddings is not None
+            and isinstance(getattr(embeddings, "token_type_ids", None), torch.Tensor)
+            and "token_type_ids" not in kwargs
+        ):
+            ref = input_ids if input_ids is not None else inputs_embeds
+            if ref is not None:
+                # Base.forward unsqueezes input_ids [seq_len] -> [1, seq_len] before
+                # calling self.model(**kwargs), but does not touch kwargs.  Build
+                # token_type_ids in [1, seq_len] shape to match what HF expects.
+                seq_len = ref.shape[0] if ref.ndim == 1 else ref.shape[1]
+                kwargs["token_type_ids"] = torch.zeros(
+                    1, seq_len, dtype=torch.long, device=ref.device
                 )
+                logger.debug_once(
+                    "Passing explicit token_type_ids=zeros to skip "
+                    "aten::gather on the HF embedding buffer."
+                )
+        return super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
 
-            module.forward = _patched_forward
-            patched += 1
 
-        if patched:
-            logger.debug(
-                "Patched %d HF embedding module(s) to skip aten::gather on token_type_ids.",
-                patched,
-            )
+class SpyreTransformersEmbeddingModel(_SpyreTokenTypeIdsMixin, TransformersEmbeddingModel):
+    """Transformers-backend embedding model with Spyre-specific fixes."""
 
 
 SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
 
 
-class SpyreTransformersForSequenceClassification(TransformersForSequenceClassification):
-    """Transformers-backend sequence-classification model; Spyre-specific patches added here."""
+class SpyreTransformersForSequenceClassification(
+    _SpyreTokenTypeIdsMixin, TransformersForSequenceClassification
+):
+    """Transformers-backend sequence-classification model with Spyre-specific fixes."""
 
 
 SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"
