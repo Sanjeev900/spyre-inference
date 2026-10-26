@@ -55,6 +55,15 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
     ),
+    "TransformersEmbeddingModel": (
+        "spyre_inference.transformers_backend:SpyreTransformersEmbeddingModel"
+    ),
+    "TransformersForSequenceClassification": (
+        "spyre_inference.transformers_backend:SpyreTransformersForSequenceClassification"
+    ),
+    "TransformersMultiModalEmbeddingModel": (
+        "spyre_inference.transformers_backend:SpyreTransformersMultiModalEmbeddingModel"
+    ),
 }
 
 

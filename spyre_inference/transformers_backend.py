@@ -37,7 +37,10 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.transformers import TransformersEmbeddingModel
 from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import TransformersForSequenceClassification
+from vllm.model_executor.models.transformers import TransformersMultiModalEmbeddingModel
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -303,5 +306,26 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 
 
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
-# against "TransformersForCausalLM", so the subclass has to keep answering to that name.
+# against the vLLM wrapper name, so every subclass must keep answering to that name.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
+
+
+class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
+    """Transformers-backend embedding model; Spyre-specific patches added here as needed."""
+
+
+SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
+
+
+class SpyreTransformersForSequenceClassification(TransformersForSequenceClassification):
+    """Transformers-backend sequence-classification model; Spyre-specific patches added here."""
+
+
+SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"
+
+
+class SpyreTransformersMultiModalEmbeddingModel(TransformersMultiModalEmbeddingModel):
+    """Transformers-backend multimodal embedding model; Spyre-specific patches added here as needed."""
+
+
+SpyreTransformersMultiModalEmbeddingModel.__name__ = "TransformersMultiModalEmbeddingModel"
