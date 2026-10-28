@@ -37,10 +37,12 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersEmbeddingModel
-from vllm.model_executor.models.transformers import TransformersForCausalLM
-from vllm.model_executor.models.transformers import TransformersForSequenceClassification
-from vllm.model_executor.models.transformers import TransformersMultiModalEmbeddingModel
+from vllm.model_executor.models.transformers import (
+    TransformersEmbeddingModel,
+    TransformersForCausalLM,
+    TransformersForSequenceClassification,
+    TransformersMultiModalEmbeddingModel,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -310,80 +312,73 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
 
 
-class _SpyreTokenTypeIdsMixin:
-    """Mixin for Transformers-backend models whose underlying HF model uses the
-    BERT/RoBERTa ``torch.gather`` pattern to derive ``token_type_ids``.
+def _patch_encoder_gather(model: nn.Module) -> None:
+    """Replace gather-based token_type_ids in HF encoder embeddings with explicit zeros."""
+    patched = 0
+    for module in model.modules():
+        buf = getattr(module, "token_type_ids", None)
+        if isinstance(buf, torch.Tensor) and hasattr(module, "word_embeddings"):
+            original_forward = module.forward
 
-    HuggingFace's BERT / RoBERTa / XLM-RoBERTa embedding forward registers a
-    ``[1, max_position_embeddings]`` all-zeros buffer called ``token_type_ids``
-    and, when no ``token_type_ids`` kwarg is passed, uses ``torch.gather`` on
-    that buffer to derive segment ids from ``position_ids``.  The output is
-    always all-zeros (the buffer is zero), but ``aten::gather.out`` is not
-    implemented in torch-spyre and crashes as soon as ``position_ids`` is on
-    device.
+            def _patched_forward(
+                *args,
+                _orig=original_forward,
+                **kwargs,
+            ) -> torch.Tensor:
+                if kwargs.get("token_type_ids") is None:
+                    input_ids = (
+                        kwargs.get("input_ids")
+                        if "input_ids" in kwargs
+                        else (args[0] if len(args) > 0 else None)
+                    )
+                    inputs_embeds = (
+                        kwargs.get("inputs_embeds")
+                        if "inputs_embeds" in kwargs
+                        else (args[3] if len(args) > 3 else None)
+                    )
+                    ref = input_ids if input_ids is not None else inputs_embeds
+                    if ref is not None:
+                        kwargs["token_type_ids"] = torch.zeros(
+                            ref.shape[:2], dtype=torch.long, device=ref.device
+                        )
+                return _orig(*args, **kwargs)
 
-    vLLM's ``Base.forward`` never passes ``token_type_ids`` to the HF model,
-    so the gather branch always fires.  This mixin overrides ``forward`` to
-    inject an explicit all-zeros ``token_type_ids`` kwarg whenever the HF
-    embedding module has that buffer, bypassing the gather entirely.  The
-    check is a no-op for any model whose embedding module does not carry the
-    buffer (decoders, RoPE encoders, etc.).
-    """
+            module.forward = _patched_forward
+            patched += 1
 
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors=None,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ):
-        embeddings = getattr(self.model, "embeddings", None)
-        if (
-            embeddings is not None
-            and isinstance(getattr(embeddings, "token_type_ids", None), torch.Tensor)
-            and "token_type_ids" not in kwargs
-        ):
-            ref = input_ids if input_ids is not None else inputs_embeds
-            if ref is not None:
-                # Base.forward unsqueezes input_ids [seq_len] -> [1, seq_len] before
-                # calling self.model(**kwargs), but does not touch kwargs.  Build
-                # token_type_ids in [1, seq_len] shape to match what HF expects.
-                seq_len = ref.shape[0] if ref.ndim == 1 else ref.shape[1]
-                kwargs["token_type_ids"] = torch.zeros(
-                    1, seq_len, dtype=torch.long, device=ref.device
-                )
-                logger.debug_once(
-                    "Passing explicit token_type_ids=zeros to skip "
-                    "aten::gather on the HF embedding buffer."
-                )
-        return super().forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
+    if patched:
+        logger.debug(
+            "Patched %d HF embedding module(s) to skip aten::gather on token_type_ids.",
+            patched,
         )
 
 
-class SpyreTransformersEmbeddingModel(_SpyreTokenTypeIdsMixin, TransformersEmbeddingModel):
+class SpyreTransformersEmbeddingModel(TransformersEmbeddingModel):
     """Transformers-backend embedding model with Spyre-specific fixes."""
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        _patch_encoder_gather(self.model)
+        return result
 
 
 SpyreTransformersEmbeddingModel.__name__ = "TransformersEmbeddingModel"
 
 
-class SpyreTransformersForSequenceClassification(
-    _SpyreTokenTypeIdsMixin, TransformersForSequenceClassification
-):
+class SpyreTransformersForSequenceClassification(TransformersForSequenceClassification):
     """Transformers-backend sequence-classification model with Spyre-specific fixes."""
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        result = super().load_weights(weights)
+        _patch_encoder_gather(self.model)
+        return result
 
 
 SpyreTransformersForSequenceClassification.__name__ = "TransformersForSequenceClassification"
 
 
 class SpyreTransformersMultiModalEmbeddingModel(TransformersMultiModalEmbeddingModel):
-    """Transformers-backend multimodal embedding model; Spyre-specific patches added here as needed."""
+    """Transformers-backend multimodal embedding model; patches added here as needed."""
 
 
 SpyreTransformersMultiModalEmbeddingModel.__name__ = "TransformersMultiModalEmbeddingModel"
