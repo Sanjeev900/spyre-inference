@@ -308,7 +308,7 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 
 
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
-# against the vLLM wrapper name, so every subclass must keep answering to that name.
+# against "TransformersForCausalLM", so the subclass has to keep answering to that name.
 SpyreTransformersForCausalLM.__name__ = "TransformersForCausalLM"
 
 
