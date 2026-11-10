@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,17 +35,40 @@ from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 pytestmark = pytest.mark.uses_subprocess
 
 _POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
+_TRANSFORMERS_ENCODER_MODEL = "ibm-granite/granite-embedding-278m-multilingual"
 _POOLING_REFS = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _COSINE_MIN = 0.99
+# RoBERTa-family models (incl. XLM-R) read their position embedding at pos + 2. A second
+# +2 (the double offset) still scores 0.992-0.998 on these prompts, so the bar has to sit
+# above that.
+_TRANSFORMERS_COSINE_MIN = 0.999
+_TRANSFORMERS_NER_MODEL = "dslim/bert-base-NER"
+_TRANSFORMERS_NER_PROMPTS = [
+    "My name is Wolfgang and I live in Berlin",
+    "George Washington went to Washington",
+]
 
 
 @pytest.mark.parametrize(
     "model_ref_output",
     [
-        (
-            "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            "\n\nIBMs main businesses are the companies that provide the services of the",
-            None,
+        pytest.param(
+            (
+                "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+                "\n\nIBMs main businesses are the companies that provide the services of the",
+                None,
+            ),
+            marks=pytest.mark.e2e_smoke,
+        ),
+        # FP8 checkpoint of the same model: QFP8WT weights and FP8 linears traced into the
+        # block graph.
+        pytest.param(
+            (
+                "ibm-ai-platform/micro-g3.3-8b-instruct-1b-FP8",
+                "\n\nIBMs are a set of standards that are used to measure the performance",
+                None,
+            ),
+            marks=[pytest.mark.fp8, pytest.mark.e2e_smoke],
         ),
         (
             "google/gemma-3-1b-it",
@@ -58,20 +84,37 @@ _COSINE_MIN = 0.99
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
             GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
-        (
-            "google/gemma-4-26B-A4B",
-            "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
-            GEMMA4_TEXT_BACKBONE_OVERRIDE,
+        # The 26B-A4B layout (MoE, sliding + full attention) at 6 layers, real weights;
+        # the full 26B-A4B is compiled by the quality gate (test_model_quality.py).
+        pytest.param(
+            (
+                "joerunde/gemma-4-moe-nano",
+                " street and ball ball. people's hats off then I account it high time",
+                GEMMA4_TEXT_BACKBONE_OVERRIDE,
+            ),
+            marks=pytest.mark.e2e_smoke,
         ),
     ],
-    ids=["micro-g3.3", "gemma-3-1b-it", "gemma-4-31B-text", "gemma-4-26B-A4B-text"],
+    ids=[
+        "micro-g3.3",
+        "micro-g3.3-fp8",
+        "gemma-3-1b-it",
+        "gemma-4-31B-text",
+        "gemma-4-moe-nano-text",
+    ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
+    """Construct `vllm.LLM(enforce_eager=False)` end-to-end under ``SPYRE_COMPILE_GUARD=error``.
 
     No compilation_config is passed: the platform defaults a non-eager run to
     STOCK_TORCH_COMPILE (one transformer block at a time + attention kernel).
+
+    The guard is what exercises its own integration rather than its mechanics -- the
+    worker arming it after ``warming_up_model()``, and the ``watch`` registrations in the
+    attention backends, the model runner, the MoE regions and the FP8 linear path. If
+    warmup really compiles everything a request needs, arming changes nothing.
     """
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     model, ref_output, hf_overrides = model_ref_output
     _assert_compiled_output(model, ref_output, monkeypatch, hf_overrides=hf_overrides)
 
@@ -86,6 +129,7 @@ def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.e2e_smoke
 def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compiled pooling pads to ``(B, L)`` and matches cached HF refs.
 
@@ -120,6 +164,7 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
         assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
+@pytest.mark.e2e_smoke
 def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compile the Transformers backend and check against a known reference.
 
@@ -134,25 +179,120 @@ def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_warmup_covers_every_compile_a_request_needs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Serve with ``SPYRE_COMPILE_GUARD=error``: a post-warmup compile kills the engine.
+def test_v2_warmup_covers_every_compile_a_request_needs() -> None:
+    """The guard test on the V2 runner, plus a prompt-logprobs request: its chunk is the
+    one lm_head width wider than any sampled batch, which warmup once left cold.
 
-    The only test that exercises the guard's integration rather than its mechanics --
-    the worker arming it after ``warming_up_model()``, and the ``watch`` registrations
-    in the attention backends, the model runner, the MoE regions and the FP8 linear
-    path. The unit tests hand-register their own functions on CPU, so a wrong callable
-    registered there, or a kernel nobody registered at all, passes them.
+    In a fresh interpreter: the Triton gate binds the runner choice at vLLM import, which
+    this process has long since done."""
+    node = f"{__file__}::test_compile_guard_with_prompt_logprobs"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            node,
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-m",
+            "not upstream",
+        ],
+        env={**os.environ, "SPYRE_MODEL_RUNNER": "v2", "_SPYRE_V2_CHILD": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    # A skipped or deselected child also exits 0.
+    assert "1 passed" in result.stdout, result.stdout[-4000:]
 
-    Uses the same model and shapes as ``test_basic_llm_inference``, so a failure here
-    is a coverage gap rather than a new workload: if warmup really compiles everything
-    a request needs, arming changes nothing.
-    """
+
+@pytest.mark.skipif(os.environ.get("_SPYRE_V2_CHILD") != "1", reason="run by the V2 test above")
+def test_compile_guard_with_prompt_logprobs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     _assert_compiled_output(
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
         "\n\nIBMs main businesses are the companies that provide the services of the",
         monkeypatch,
+        prompt_logprobs=1,
     )
+
+
+@pytest.mark.e2e_smoke
+def test_transformers_backend_encoder_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compiled ``model_impl="transformers"`` encoder embedding matches cached HF refs.
+
+    ``SpyreTransformersEmbeddingModel`` is compiled per transformer block (the
+    default ``SPYRE_COMPILE_GRANULARITY``). Verifies that the XLM-RoBERTa gather-free
+    embedding patch and the single RoBERTa position offset survive compilation.
+    """
+    from vllm import LLM
+
+    refs = json.loads(_POOLING_REFS.read_text())[_TRANSFORMERS_ENCODER_MODEL]
+    prompts = refs["prompts"]
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    engine = LLM(
+        model=_TRANSFORMERS_ENCODER_MODEL,
+        runner="pooling",
+        model_impl="transformers",
+        enforce_eager=False,
+        max_model_len=64,
+        max_num_seqs=2,
+    )
+    outputs = engine.embed(prompts)
+    assert len(outputs) == len(prompts)
+    for out, ref_emb in zip(outputs, refs["embeddings"]):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb)
+        assert all(math.isfinite(x) for x in emb)
+        sim = F.cosine_similarity(
+            torch.tensor(emb, dtype=torch.float32),
+            torch.tensor(ref_emb, dtype=torch.float32),
+            dim=0,
+        ).item()
+        assert sim >= _TRANSFORMERS_COSINE_MIN, f"cosine {sim:.5f} < {_TRANSFORMERS_COSINE_MIN}"
+
+
+def test_transformers_backend_token_classify_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compiled ``model_impl="transformers"`` BERT NER matches HF on every token's label.
+
+    Covers ``SpyreTransformersForSequenceClassification`` (BERT, no position offset) on the
+    ``token_classify`` task, where upstream's ``ClassifierWithReshape`` returns
+    ``[tokens, 1, labels]``.
+    """
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+    from vllm import LLM
+
+    tok = AutoTokenizer.from_pretrained(_TRANSFORMERS_NER_MODEL)
+    hf = AutoModelForTokenClassification.from_pretrained(
+        _TRANSFORMERS_NER_MODEL, dtype=torch.float32
+    ).eval()
+    with torch.inference_mode():
+        refs = [
+            hf(**tok(p, return_tensors="pt")).logits[0].softmax(-1)
+            for p in _TRANSFORMERS_NER_PROMPTS
+        ]
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    engine = LLM(
+        model=_TRANSFORMERS_NER_MODEL,
+        runner="pooling",
+        model_impl="transformers",
+        enforce_eager=False,
+        max_model_len=128,
+        max_num_seqs=1,
+    )
+    assert engine.llm_engine.model_config.using_transformers_backend()
+    outputs = engine.encode(_TRANSFORMERS_NER_PROMPTS, pooling_task="token_classify")
+    assert len(outputs) == len(_TRANSFORMERS_NER_PROMPTS)
+    for prompt, out, ref in zip(_TRANSFORMERS_NER_PROMPTS, outputs, refs):
+        got = torch.as_tensor(out.outputs.data).float().reshape(ref.shape)
+        assert torch.isfinite(got).all()
+        assert torch.equal(got.argmax(-1), ref.argmax(-1)), (
+            f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
+        )
+        assert (got - ref).abs().max().item() < 1e-2, f"{prompt!r}: scores drifted from HF"
 
 
 def _assert_compiled_output(
@@ -162,6 +302,7 @@ def _assert_compiled_output(
     *,
     hf_overrides=None,
     model_impl: str | None = None,
+    prompt_logprobs: int | None = None,
 ) -> None:
     from vllm import LLM, SamplingParams
     from vllm.config import CompilationConfig
@@ -186,9 +327,11 @@ def _assert_compiled_output(
 
     output = engine.generate(
         prompt,
-        SamplingParams(temperature=0.0, max_tokens=16),
+        SamplingParams(temperature=0.0, max_tokens=16, prompt_logprobs=prompt_logprobs),
         use_tqdm=False,
     )
 
     assert prompt == output[0].prompt, "Model output contained wrong prompt!"
     assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"
+    if prompt_logprobs is not None:
+        assert output[0].prompt_logprobs, "No prompt logprobs returned!"
