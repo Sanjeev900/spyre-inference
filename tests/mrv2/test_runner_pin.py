@@ -122,9 +122,13 @@ def test_hybrid_kv_cache_manager_setting_survives_config_init(
     ("feature", "configure"),
     [
         pytest.param(
-            "speculative decoding other than DFlash/XPress",
-            lambda c: setattr(c, "speculative_config", SimpleNamespace(use_dflash=lambda: False)),
-            id="spec-decode-non-dflash",
+            "speculative decoding other than DFlash/XPress/DSpark",
+            lambda c: setattr(
+                c,
+                "speculative_config",
+                SimpleNamespace(use_dflash=lambda: False, use_dspark=lambda: False),
+            ),
+            id="spec-decode-unsupported-method",
         ),
         pytest.param(
             "batch-sharded sampling",
@@ -172,6 +176,16 @@ def test_a_plain_v2_config_passes_the_feature_check(
     monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
 ) -> None:
     _set_runner(monkeypatch, "v2")
+    TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
+
+
+def test_a_dspark_config_passes_the_feature_check(
+    monkeypatch: pytest.MonkeyPatch, vllm_config: VllmConfig
+) -> None:
+    _set_runner(monkeypatch, "v2")
+    vllm_config.speculative_config = SimpleNamespace(
+        use_dflash=lambda: False, use_dspark=lambda: True
+    )
     TorchSpyrePlatform._reject_unsupported_v2_features(vllm_config)
 
 

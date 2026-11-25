@@ -79,10 +79,32 @@ def keep_attention_buffers_on_host() -> None:
     Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
 
-def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
-    """Move the layer weights to Spyre."""
+def move_model_to_spyre(
+    model: nn.Module, device: torch.device, keep_on_host: tuple[str, ...] = ()
+) -> None:
+    """Move the layer weights to Spyre, leaving the named parameters on the host.
+
+    A keep_on_host entry matches parameters whose dotted name starts with it or
+    contains it after a dot ("model.markov_head." matches
+    "model.markov_head.markov_w1.weight"); the pop-move-restore shape follows
+    SpyreParallelLMHead._apply.
+    """
     keep_attention_buffers_on_host()
-    model.to(device=device)
+    kept = []
+    for name, param in model.named_parameters():
+        if not any(name.startswith(keep) or f".{keep}" in name for keep in keep_on_host):
+            continue
+        module = model
+        for part in name.split(".")[:-1]:
+            module = getattr(module, part)
+        kept.append((module, name.rpartition(".")[2], param))
+    for module, local, _ in kept:
+        del module._parameters[local]
+    try:
+        model.to(device=device)
+    finally:
+        for module, local, param in kept:
+            module._parameters[local] = param
 
 
 def resolve_kv_scales(model: nn.Module, static_forward_context: dict[str, Any]) -> bool:

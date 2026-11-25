@@ -14,7 +14,7 @@
 
 # Upstream's DFlash loader accepts any subset of these weights.
 
-"""Validate the published Qwen3 DFlash/XPress backbone weights."""
+"""Validate the published Qwen3 DFlash/XPress/DSpark backbone weights."""
 
 from collections.abc import Mapping
 
@@ -68,6 +68,78 @@ def validate_dflash_weights(config, weights: Mapping[str, torch.Tensor]) -> None
         )
     for name in present & optional:
         expected[name] = (config.vocab_size, hidden)
+    for name, shape in expected.items():
+        if tuple(weights[name].shape) != shape:
+            raise ValueError(
+                f"{scope}. Invalid {name} shape: expected {shape}, got {tuple(weights[name].shape)}"
+            )
+
+
+def validate_dspark_weights(config, weights: Mapping[str, torch.Tensor]) -> None:
+    hidden = config.hidden_size
+    head = getattr(config, "head_dim", None)
+    rank = getattr(config, "markov_rank", None)
+    aux_layers = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+    scope = "Only published Qwen3 DSpark checkpoint layouts are supported"
+    if (
+        head is None
+        or rank is None
+        or aux_layers is None
+        or (getattr(config, "target_hidden_size", None) or hidden) != hidden
+        or getattr(config, "attention_bias", False)
+    ):
+        raise ValueError(
+            f"{scope}: require an explicit head_dim, markov_rank, aux hidden-state "
+            "layer ids, equal target/draft hidden sizes, and attention_bias=False"
+        )
+    draft_vocab = getattr(config, "draft_vocab_size", None) or config.vocab_size
+    query = config.num_attention_heads * head
+    kv = config.num_key_value_heads * head
+    intermediate = config.intermediate_size
+    expected = {
+        "fc.weight": (hidden, hidden * len(aux_layers)),
+        "hidden_norm.weight": (hidden,),
+        "norm.weight": (hidden,),
+        "markov_head.markov_w1.weight": (config.vocab_size, rank),
+        "markov_head.markov_w2.weight": (draft_vocab, rank),
+    }
+    layer_shapes = {
+        "self_attn.q_proj.weight": (query, hidden),
+        "self_attn.k_proj.weight": (kv, hidden),
+        "self_attn.v_proj.weight": (kv, hidden),
+        "self_attn.o_proj.weight": (hidden, query),
+        "self_attn.q_norm.weight": (head,),
+        "self_attn.k_norm.weight": (head,),
+        "mlp.gate_proj.weight": (intermediate, hidden),
+        "mlp.up_proj.weight": (intermediate, hidden),
+        "mlp.down_proj.weight": (hidden, intermediate),
+        "input_layernorm.weight": (hidden,),
+        "post_attention_layernorm.weight": (hidden,),
+    }
+    for layer in range(config.num_hidden_layers):
+        expected.update({f"layers.{layer}.{name}": shape for name, shape in layer_shapes.items()})
+    optional = {
+        "embed_tokens.weight": (config.vocab_size, hidden),
+        "t2d": (config.vocab_size,),
+    }
+    if draft_vocab < config.vocab_size:
+        # A reduced-vocab draft cannot share the target's lm_head (upstream raises
+        # at load) and needs the d2t map to return target ids.
+        expected["lm_head.weight"] = (draft_vocab, hidden)
+        expected["d2t"] = (draft_vocab,)
+    else:
+        optional["lm_head.weight"] = (draft_vocab, hidden)
+        optional["d2t"] = (draft_vocab,)
+    # Training-only; upstream's loader skips the confidence head entirely.
+    present = {name for name in weights if not name.startswith("confidence_head.")}
+    missing = expected.keys() - present
+    unexpected = present - expected.keys() - optional.keys()
+    if missing or unexpected:
+        raise ValueError(
+            f"{scope}. Invalid DSpark backbone weights: missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
+    expected.update({name: shape for name, shape in optional.items() if name in present})
     for name, shape in expected.items():
         if tuple(weights[name].shape) != shape:
             raise ValueError(

@@ -23,6 +23,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from spyre_inference.v1.worker.spyre import model_runner, spec_decode
+from spyre_inference.v1.worker.spyre.dspark import SpyreDSparkSpeculator
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator, _DraftBatchPadding
 
 BLOCK = 4  # one anchor and three drafts
@@ -237,13 +238,18 @@ def test_the_runner_replaces_upstreams_speculator(monkeypatch):
 
     monkeypatch.setattr(GPUModelRunner, "__init__", upstream_init)
     monkeypatch.setattr(model_runner, "validate_dflash_config", lambda config: None)
+    monkeypatch.setattr(model_runner, "validate_dspark_config", lambda config: None)
+    # select() resolves the class through the module attribute at call time.
     monkeypatch.setattr(
-        model_runner,
+        spec_decode,
         "SpyreDFlashSpeculator",
         lambda config, device, spyre_device: ("spyre", device, spyre_device),
     )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash", use_dflash=lambda: True)
+    )
     spyre = torch.device("meta")
-    runner = model_runner.SpyreModelRunnerV2(SimpleNamespace(), spyre)
+    runner = model_runner.SpyreModelRunnerV2(config, spyre)
     assert runner.speculator == ("spyre", torch.device("cpu"), spyre)
 
 
@@ -252,5 +258,39 @@ def test_the_runner_builds_no_speculator_without_one(monkeypatch):
         GPUModelRunner, "__init__", lambda self, c, d: setattr(self, "speculator", None)
     )
     monkeypatch.setattr(model_runner, "validate_dflash_config", lambda config: None)
+    monkeypatch.setattr(model_runner, "validate_dspark_config", lambda config: None)
     runner = model_runner.SpyreModelRunnerV2(SimpleNamespace(), torch.device("meta"))
     assert runner.speculator is None
+
+
+def test_dspark_resolves_through_the_spyre_dflash_overrides():
+    """MRO SpyreDSpark -> SpyreDFlash -> DSpark -> DFlash: our execution machinery
+    wins, upstream's dspark __init__/load run inside it."""
+    names = [c.__name__ for c in SpyreDSparkSpeculator.__mro__[:4]]
+    assert names == [
+        "SpyreDSparkSpeculator",
+        "SpyreDFlashSpeculator",
+        "DSparkSpeculator",
+        "DFlashSpeculator",
+    ]
+    for method in ("propose", "load_draft_model", "set_attn", "_generate_draft", "capture"):
+        assert getattr(SpyreDSparkSpeculator, method) is getattr(SpyreDFlashSpeculator, method)
+    assert issubclass(SpyreDSparkSpeculator, SpyreDFlashSpeculator)  # warmup's isinstance
+    assert SpyreDSparkSpeculator.keep_on_host == ("model.markov_head.", "draft_id_to_target_id")
+
+
+def test_a_dspark_step_warms_seven_row_blocks(speculator):
+    """The fill-in layout drafts 1 + K = block_size rows per request."""
+    speculator.__class__ = SpyreDSparkSpeculator
+    speculator.num_query_per_req = 7
+    speculator.draft_tokens = torch.full((4, 6), -7, dtype=torch.int64)
+    speculator.model.propose_block = lambda hidden, anchor_ids: [
+        [a + 1 + k for k in range(6)] for a in anchor_ids.tolist()
+    ]
+    speculator.warm_draft_batches()
+    widths = [len(ids) for ids, _ in speculator.model.forwards]
+    assert widths == [28, 14, 7]
+    for ids, _ in speculator.model.forwards:
+        # The bonus token sits at offset 0 of each 7-row block; the rest is mask.
+        assert ids[::7] == [0] * (len(ids) // 7)
+        assert all(t == MASK for i, t in enumerate(ids) if i % 7)

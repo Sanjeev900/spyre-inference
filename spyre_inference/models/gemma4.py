@@ -229,7 +229,7 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         cls, vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
     ) -> list[KVCacheGroupSpec]:
         speculative = vllm_config.speculative_config
-        if speculative is None or not speculative.use_dflash():
+        if speculative is None or not (speculative.use_dflash() or speculative.use_dspark()):
             return get_kv_cache_groups(vllm_config, kv_cache_spec)
         # Full allocation shares a block table without merging target/draft windows.
         specs = {

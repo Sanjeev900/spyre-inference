@@ -1,4 +1,4 @@
-# XPress speculative decoding
+# XPress and DSpark speculative decoding
 
 XPress runs a DFlash backbone once, refines a block of draft tokens, and lets
 the target model verify the proposals. The experimental Spyre integration loads
@@ -76,6 +76,42 @@ The explicit `xpress_topc=128` overrides this checkpoint's 512-candidate default
 The draft shares the target's raw embedding and output-head weights, matching
 upstream; Gemma's embedding scaling and logit softcap remain in the target.
 
+## Run DSpark on Gemma 4 26B A4B
+
+DSpark runs the same DFlash block forward and then samples the proposals
+sequentially: each draft token's logits get a low-rank transition bias derived
+from the previously sampled token (the Markov head), over a reduced 32k draft
+vocabulary mapped back to target IDs. The supported pair is
+`makora-ai/gemma4-26b-a4b-dspark` on `google/gemma-4-26B-A4B-it`:
+
+```bash
+export SPYRE_ATTN_QUERY_BUCKETS=1,7,14,28
+uv run --no-sync vllm serve google/gemma-4-26B-A4B-it \
+  --revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
+  --tokenizer-revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
+  --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+  --dtype float16 --tensor-parallel-size 1 \
+  --max-num-seqs 1 --max-model-len 2304 --max-num-batched-tokens 64 \
+  --no-enable-prefix-caching \
+  --compilation-config '{"compile_sizes": [1, 7, 14, 28]}' \
+  --speculative-config '{"method": "dspark", "model": "makora-ai/gemma4-26b-a4b-dspark", "revision": "e6f739231e892fe4512c470136490d5441ffe62f", "num_speculative_tokens": 6}'
+```
+
+The checkpoint's fill-in layout drafts one bonus row plus six proposals per
+request (seven rows per block), so the compile sizes and query buckets above
+cover 7, 14 and 28 rows. Pass `num_speculative_tokens=6` explicitly: vLLM
+defaults it to the checkpoint's `block_size` (7), which the adapter rejects.
+For four concurrent requests, set `--max-num-seqs 4` and
+`--max-num-batched-tokens 128`.
+
+Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1, up to
+four active requests, prefix caching disabled, greedy proposals, and the
+fill-in layout only. Adaptive verification and `dspark_draft_topk` are
+unsupported. The Markov head and the draft-to-target ID map stay on the host;
+the block forward and candidate scoring run on Spyre. The end-to-end test
+(`tests/e2e/test_dspark_v2.py`) and CI's public-model cache pin the same
+checkpoint revision as this example; update both together.
+
 ## Refinement and compatibility
 
 The refiner follows [merged vLLM XPress](https://github.com/vllm-project/vllm/pull/54448):
@@ -121,6 +157,7 @@ for now ([#1238](https://github.com/torch-spyre/spyre-inference/issues/1238)).
 uv run --no-sync pytest tests/spec_decode -m 'not upstream'
 uv run --no-sync pytest tests/e2e/test_xpress_feedback.py -m 'not upstream' -s
 uv run --no-sync pytest tests/e2e/test_xpress_v2.py -m model_quality -s
+uv run --no-sync pytest tests/e2e/test_dspark_v2.py -m model_quality -s
 ```
 
 PR regression jobs prefetch both pinned models before running the quality gate.

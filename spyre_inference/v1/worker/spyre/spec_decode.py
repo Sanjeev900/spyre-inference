@@ -61,6 +61,10 @@ class _DraftBatchPadding:
 class SpyreDFlashSpeculator(DFlashSpeculator):
     model: "SpyreDFlashQwen3ForCausalLM"
 
+    # Parameters move_model_to_spyre leaves on the host, as segment paths of the
+    # dotted parameter names.
+    keep_on_host: tuple[str, ...] = ()
+
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, spyre_device: torch.device
     ) -> None:
@@ -73,7 +77,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
             "SpyreDFlashQwen3ForCausalLM",
             super().load_draft_model(target_model, target_attn_layer_names),
         )
-        move_model_to_spyre(model, self.spyre_device)
+        move_model_to_spyre(model, self.spyre_device, keep_on_host=self.keep_on_host)
         model.prepare_for_spyre()
         return model
 
