@@ -90,11 +90,15 @@ class SpyreQwen3DSparkForCausalLM(SpyreDFlashQwen3ForCausalLM, Qwen3DSparkForCau
         super().prepare_for_spyre()
         self.model.markov_head.prepare_for_spyre()
 
-    def propose_block(self, hidden_states, anchor_ids):
+    def propose_block(self, hidden_states, anchor_ids, num_reqs=None, sampler=None):
         # Upstream's _sample_sequential over host tensors: a per-step Markov bias
-        # on the base logits, argmax in draft space, then the d2t map to target
-        # ids. prev always holds target ids; markov_w1 is indexed by target ids.
+        # on the base logits, then greedy argmax or the seeded sampler, then the
+        # d2t map to target ids. prev always holds target ids; markov_w1 is
+        # indexed by target ids. The sampler draws only the real rows — padded
+        # rows have no request-state index and would corrupt the logits cache.
         batch = anchor_ids.numel()
+        if num_reqs is None:
+            num_reqs = batch
         block = hidden_states.shape[0] // batch
         base = self.compute_device_logits(hidden_states).view(batch, block, -1)
         host_base = self._copy_logits_to_cpu(base)[:, 1:, : self.config.draft_vocab_size]
@@ -103,8 +107,18 @@ class SpyreQwen3DSparkForCausalLM(SpyreDFlashQwen3ForCausalLM, Qwen3DSparkForCau
         drafts = torch.empty(batch, host_base.shape[1], dtype=torch.int64)
         prev = anchor_ids
         for step in range(host_base.shape[1]):
-            draft_id = (host_base[:, step] + head.bias(head.embed(prev))).argmax(-1)
-            token = draft_id if d2t is None else draft_id + d2t[draft_id]
+            biased = host_base[:, step] + head.bias(head.embed(prev))
+            if sampler is None:
+                draft_id = biased.argmax(-1)
+                token = draft_id if d2t is None else draft_id + d2t[draft_id]
+            else:
+                token = torch.empty(batch, dtype=torch.int64)
+                token[:num_reqs] = sampler(biased[:num_reqs], step, num_reqs)
+                if batch > num_reqs:
+                    # Padded rows keep the greedy pick: valid ids for the next
+                    # step's embedding, discarded by the caller.
+                    pad_id = biased[num_reqs:].argmax(-1)
+                    token[num_reqs:] = pad_id if d2t is None else pad_id + d2t[pad_id]
             drafts[:, step] = token
             prev = token
         return drafts.tolist()

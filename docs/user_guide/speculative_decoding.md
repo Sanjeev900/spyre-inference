@@ -5,10 +5,10 @@ the target model verify the proposals. The experimental Spyre integration loads
 published XPress checkpoints directly for Qwen3-8B and Gemma 4 26B A4B;
 checkpoint conversion is not required.
 
-Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1, up to four
+Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1, up to eight
 active requests, and prefix caching disabled. The checkpoint fixes the block at one anchor plus 15 proposals.
-The four-request cap reflects the batches validated on Spyre so far. Larger
-batches require additional device validation before raising this limit.
+The eight-request cap is the shared draft-family limit; the largest XPress
+batches validated on Spyre so far are four.
 
 ## Run Qwen3-8B
 
@@ -31,26 +31,28 @@ sampling. The same speculative configuration works with `vllm.LLM`.
 The end-to-end test (`tests/e2e/test_xpress_v2.py`) and CI's public-model cache
 list pin the same model and checkpoint revisions as this example; update all
 three together. A full
-verification round needs at least 31 budgeted tokens because vLLM reserves
-additional drafting slots; the adapter rejects a smaller budget.
+verification round needs at least 16 budgeted tokens, one per verified row;
+the adapter rejects a smaller budget.
 
-For four concurrent requests, set `--max-num-seqs 4`,
+For up to eight concurrent requests, set `--max-num-seqs 8`,
 `--max-num-batched-tokens 128`, and
 `--compilation-config '{"compile_sizes": [1, 16, 32, 64, 128]}'`.
 Set `SPYRE_ATTN_QUERY_BUCKETS=1,16,64,128` for this token budget.
 Set `SPYRE_MAX_NUM_PARTIAL_PREFILLS=4` to allow four partial prefills.
-The draft body uses batches of 1, 2, or 4; three active requests pad to four.
+The draft body uses batches of 1, 2, 4 or 8; other active counts pad up.
 Each request retains its own accepted context, page table, and output limit.
 
-The batch-four PR test uses these settings. Trunk CI additionally covers default
+The batch-four PR test uses these settings at `--max-num-seqs 4`. Trunk CI
+additionally covers default
 attention buckets, compilation sizes and the default single partial prefill.
 
 | Maximum requests | Minimum token budget |
 | --- | --- |
-| 1 | 31 |
-| 2 | 62 |
-| 3 | 93 |
-| 4 | 124 |
+| 1 | 16 |
+| 2 | 32 |
+| 3 | 48 |
+| 4 | 64 |
+| 8 | 128 |
 
 ## Run Gemma 4 26B A4B
 
@@ -85,30 +87,51 @@ vocabulary mapped back to target IDs. The supported pair is
 `makora-ai/gemma4-26b-a4b-dspark` on `google/gemma-4-26B-A4B-it`:
 
 ```bash
-export SPYRE_ATTN_QUERY_BUCKETS=1,7,14,28
 uv run --no-sync vllm serve google/gemma-4-26B-A4B-it \
   --revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
   --tokenizer-revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
   --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
   --dtype float16 --tensor-parallel-size 1 \
-  --max-num-seqs 1 --max-model-len 2304 --max-num-batched-tokens 64 \
+  --max-num-seqs 8 --max-model-len 8192 --max-num-batched-tokens 128 \
   --no-enable-prefix-caching \
-  --compilation-config '{"compile_sizes": [1, 7, 14, 28]}' \
   --speculative-config '{"method": "dspark", "model": "makora-ai/gemma4-26b-a4b-dspark", "revision": "e6f739231e892fe4512c470136490d5441ffe62f", "num_speculative_tokens": 6}'
 ```
 
-The checkpoint's fill-in layout drafts one bonus row plus six proposals per
-request (seven rows per block), so the compile sizes and query buckets above
-cover 7, 14 and 28 rows. Pass `num_speculative_tokens=6` explicitly: vLLM
-defaults it to the checkpoint's `block_size` (7), which the adapter rejects.
-For four concurrent requests, set `--max-num-seqs 4` and
-`--max-num-batched-tokens 128`.
+Pass `num_speculative_tokens=6` explicitly: vLLM defaults it to the
+checkpoint's `block_size` (7), which the adapter rejects. The token budget
+must cover eight concurrent requests (`max_num_batched_tokens` >= 56).
 
-Supported configuration: compiled FP16, unquantized weights, TP=1, PP=1, up to
-four active requests, prefix caching disabled, greedy proposals, and the
-fill-in layout only. Adaptive verification and `dspark_draft_topk` are
-unsupported. The Markov head and the draft-to-target ID map stay on the host;
-the block forward and candidate scoring run on Spyre. The end-to-end test
+The defaults cover every shape, but DSpark's seven-row draft blocks then pad
+to `max_num_batched_tokens` on each step. For unpadded steps, pin the tight
+ladders: `--compilation-config '{"compile_sizes": [1, 7, 14, 28, 56]}'` and
+`export SPYRE_ATTN_QUERY_BUCKETS=1,7,14,28,56`. Pinning the ladder also caps
+the token budget: the platform clamps `max_num_batched_tokens` to the largest
+compile size, so a ladder stopping at 56 halves this command's 128-token budget.
+
+The 32k-context production shape shards across four cards (32 requests at
+TP4):
+
+```bash
+export SPYRE_ATTN_QUERY_BUCKETS=1,7,14,28,56,112,224
+export SPYRE_ATTN_KV_BUCKETS=128,1024,4096,16384,32768
+uv run --no-sync vllm serve google/gemma-4-26B-A4B-it \
+  --revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
+  --tokenizer-revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 \
+  --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+  --dtype float16 --tensor-parallel-size 4 \
+  --max-num-seqs 32 --max-model-len 32768 --max-num-batched-tokens 224 \
+  --no-enable-prefix-caching \
+  --compilation-config '{"compile_sizes": [1, 7, 14, 28, 56, 112, 224]}' \
+  --speculative-config '{"method": "dspark", "model": "makora-ai/gemma4-26b-a4b-dspark", "revision": "e6f739231e892fe4512c470136490d5441ffe62f", "num_speculative_tokens": 6}'
+```
+
+Supported configuration: compiled FP16, unquantized weights, PP=1, TP=1 or
+TP=4 (the draft shards with the target), up to eight active requests at TP1
+and 32 at TP4, prefix caching disabled, greedy or probabilistic
+proposals, and the fill-in layout only. Adaptive verification and
+`dspark_draft_topk` are unsupported. The
+Markov head and the draft-to-target ID map stay on the host; the block
+forward and candidate scoring run on Spyre. The end-to-end test
 (`tests/e2e/test_dspark_v2.py`) and CI's public-model cache pin the same
 checkpoint revision as this example; update both together.
 

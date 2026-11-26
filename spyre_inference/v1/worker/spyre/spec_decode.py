@@ -191,8 +191,12 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         hidden = self._run_model(num_tokens_padded, *args, **kwargs)
         block = self.num_query_per_req
         anchors = self.input_buffers.input_ids[:num_tokens_padded:block].to(torch.int64)
-        proposals = self.model.propose_block(hidden, anchors)
+        proposals = self.model.propose_block(hidden, anchors, num_reqs, self.make_draft_sampler())
         self.draft_tokens[:num_reqs] = torch.tensor(proposals[:num_reqs])
+
+    def make_draft_sampler(self):
+        """Greedy drafting samples nothing; probabilistic subclasses override."""
+        return None
 
     def warm_draft_batches(self) -> None:
         """The draft forward and proposal at every padded batch _DraftBatchPadding serves.

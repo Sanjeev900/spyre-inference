@@ -157,9 +157,13 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         return self._combine(hidden_states)
 
     def compute_device_logits(self, hidden_states):
-        # TP=1 and the shared full vocabulary are checked before model loading.
+        # The lm_head GEMM yields this rank's vocab shard; gather the full
+        # vocabulary when the head is sharded (the target path's lowering).
         method = cast(SpyreUnquantizedLMHeadMethod, self.lm_head.quant_method)
-        return method.apply(self.lm_head, hidden_states)
+        logits = method.apply(self.lm_head, hidden_states)
+        if getattr(self.lm_head, "tp_size", 1) > 1:
+            logits = self.logits_processor._gather_logits(logits)
+        return logits
 
     def _copy_logits_to_cpu(self, logits):
         # Cast during D2H: device widening produces a nonstandard lane arrangement.
@@ -168,7 +172,9 @@ class SpyreDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def _argmax_on_cpu(self, host_logits):
         return host_logits.argmax(-1)
 
-    def propose_block(self, hidden_states, anchor_ids):
+    def propose_block(self, hidden_states, anchor_ids, num_reqs=None, sampler=None):
+        # Greedy only: num_reqs and sampler arrive for signature parity with the
+        # dspark model and are unused (the dflash validator enforces greedy).
         batch = anchor_ids.numel()
         hidden_blocks = hidden_states.view(batch, -1, hidden_states.shape[-1])
         base = self.compute_device_logits(hidden_states).view(batch, hidden_blocks.shape[1], -1)

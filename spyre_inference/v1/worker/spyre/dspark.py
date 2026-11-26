@@ -22,6 +22,7 @@ dspark.utils) stays behind the dispatch table's lazy builder.
 from contextlib import contextmanager
 
 import torch
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 from spyre_inference.custom_ops.utils import convert
@@ -36,6 +37,41 @@ class SpyreDSparkSpeculator(SpyreDFlashSpeculator, DSparkSpeculator):
     def load_draft_model(self, target_model, target_attn_layer_names):
         with _host_side_sharing_comparison():
             return super().load_draft_model(target_model, target_attn_layer_names)
+
+    def make_draft_sampler(self):
+        """Upstream's _sample_logits: scatter draft-vocab logits into target
+        space, then draw through the seeded gumbel sampler so rejection
+        sampling sees the draft's true proposal distribution."""
+        if self.draft_logits is None:
+            return None
+        draft_logits = self.draft_logits
+
+        def sample(logits, step, num_reqs):
+            logits = logits.to(draft_logits.dtype)
+            if self._d2t_scatter_index is not None:
+                # Allocated alongside the scatter index in load_draft_model.
+                buf = self._draft_scatter_buf[: logits.shape[0]]  # ty: ignore[not-subscriptable]
+                buf.index_copy_(1, self._d2t_scatter_index, logits)
+                logits = buf
+            # sample_pos is the predicted token's position P; a draw keys on P-1.
+            # idx_map and sample_pos are kernel-filled for the real requests.
+            n_spec = self.num_speculative_steps
+            idx_map = self.sample_idx_mapping[: num_reqs * n_spec].view(num_reqs, n_spec)
+            pos = self.sample_pos[: num_reqs * n_spec].view(num_reqs, n_spec)
+            return gumbel_sample(
+                logits,
+                idx_map[:, step],
+                self.temperature,
+                self.seeds,
+                pos[:, step] - 1,
+                apply_temperature=True,
+                is_drafting=True,
+                logits_cache=draft_logits,
+                logits_cache_col=self._step_cols[step],
+                use_fp64=self.use_fp64_gumbel,
+            )
+
+        return sample
 
 
 @contextmanager

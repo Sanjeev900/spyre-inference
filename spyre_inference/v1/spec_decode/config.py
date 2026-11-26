@@ -14,7 +14,7 @@
 
 import torch
 
-MAX_DFLASH_BATCH_SIZE = 4
+MAX_DRAFT_BATCH_PER_RANK = 8
 
 
 def normalize_speculative_config(engine_args) -> None:
@@ -51,14 +51,13 @@ def _validate_serving_constraints(config, spec, name: str) -> None:
         or spec.draft_model_config.quantization is not None
     ):
         raise ValueError(f"{name} currently requires unquantized target and draft weights")
-    if (
-        parallel.tensor_parallel_size != 1
-        or parallel.pipeline_parallel_size != 1
-        or not 1 <= config.scheduler_config.max_num_seqs <= MAX_DFLASH_BATCH_SIZE
+    # TP replicates the request batch on every rank; the cap grows with TP
+    # because 8 requests at TP1 and 32 at TP4 are the shapes validated on Spyre.
+    max_seqs = MAX_DRAFT_BATCH_PER_RANK * parallel.tensor_parallel_size
+    if parallel.pipeline_parallel_size != 1 or (
+        not 1 <= config.scheduler_config.max_num_seqs <= max_seqs
     ):
-        raise ValueError(
-            f"{name} currently requires TP=1, PP=1 and max_num_seqs<={MAX_DFLASH_BATCH_SIZE}"
-        )
+        raise ValueError(f"{name} currently requires PP=1 and max_num_seqs<={max_seqs}")
     if config.cache_config.enable_prefix_caching:
         raise ValueError(
             f"Disable prefix caching for {name}: draft context needs every target state"
@@ -68,8 +67,6 @@ def _validate_serving_constraints(config, spec, name: str) -> None:
         config.model_config.is_multimodal_model
     ):
         raise ValueError(f"{name} supports Qwen3 and Gemma 4 text targets")
-    if spec.draft_sample_method != "greedy":
-        raise ValueError(f"{name} currently uses greedy proposals")
     block = spec.num_speculative_tokens + 1
     minimum_budget = config.scheduler_config.max_num_seqs * (
         block + spec.max_num_new_slots_for_drafting
@@ -94,7 +91,11 @@ def validate_dflash_config(config) -> None:
             f"Unsupported Spyre DFlash/XPress draft architecture: {architecture}. "
             f"Supported architectures: {', '.join(sorted(supported_drafts))}"
         )
+    if config.parallel_config.tensor_parallel_size != 1:
+        raise ValueError("Spyre DFlash/XPress currently requires TP=1")
     _validate_serving_constraints(config, spec, "Spyre DFlash/XPress")
+    if spec.draft_sample_method != "greedy":
+        raise ValueError("Spyre DFlash/XPress currently uses greedy proposals")
     target = config.model_config.hf_text_config
     if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
         raise ValueError("The draft must share the target hidden size and full vocabulary")

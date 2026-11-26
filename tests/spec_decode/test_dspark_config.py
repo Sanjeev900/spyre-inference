@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from spyre_inference.v1.spec_decode.config import (
+    MAX_DRAFT_BATCH_PER_RANK,
     normalize_speculative_config,
     validate_dspark_config,
 )
@@ -105,7 +106,7 @@ def config():
     )
 
 
-@pytest.mark.parametrize("batch", [1, 2, 3, 4])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_the_makora_contract_is_accepted_and_the_confidence_head_is_dropped(config, batch):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = 28 * batch
@@ -182,13 +183,44 @@ def test_shared_serving_constraints_apply(config, name, value, match):
 
 
 def test_shared_parallel_and_batch_limits_apply(config):
-    config.parallel_config.tensor_parallel_size = 2
-    with pytest.raises(ValueError, match="TP=1, PP=1"):
+    config.parallel_config.pipeline_parallel_size = 2
+    with pytest.raises(ValueError, match="PP=1"):
         validate_dspark_config(config)
-    config.parallel_config.tensor_parallel_size = 1
-    config.scheduler_config.max_num_seqs = 5
+    config.parallel_config.pipeline_parallel_size = 1
+    config.scheduler_config.max_num_seqs = MAX_DRAFT_BATCH_PER_RANK + 1
     with pytest.raises(ValueError, match="max_num_seqs"):
         validate_dspark_config(config)
+
+
+def test_dspark_accepts_tensor_parallelism_and_probabilistic_sampling(config):
+    # The draft shards with the target; sampling runs through the seeded
+    # gumbel host op with lossless rejection.
+    config.parallel_config.tensor_parallel_size = 4
+    config.speculative_config.draft_sample_method = "probabilistic"
+    validate_dspark_config(config)
+
+
+@pytest.mark.parametrize(
+    "tp,seqs,accepted",
+    [
+        (1, MAX_DRAFT_BATCH_PER_RANK, True),
+        (1, MAX_DRAFT_BATCH_PER_RANK + 1, False),
+        (2, MAX_DRAFT_BATCH_PER_RANK * 2, True),
+        (4, MAX_DRAFT_BATCH_PER_RANK * 4, True),
+        (4, MAX_DRAFT_BATCH_PER_RANK * 4 + 1, False),
+    ],
+)
+def test_the_batch_cap_grows_with_tensor_parallelism(config, tp, seqs, accepted):
+    # TP replicates the batch on every rank; the cap tracks the validated
+    # shapes: 8 requests at TP1, 32 at the TP4 production shape.
+    config.parallel_config.tensor_parallel_size = tp
+    config.scheduler_config.max_num_seqs = seqs
+    config.scheduler_config.max_num_batched_tokens = 7 * seqs
+    if accepted:
+        validate_dspark_config(config)
+    else:
+        with pytest.raises(ValueError, match="max_num_seqs"):
+            validate_dspark_config(config)
 
 
 def test_the_token_budget_covers_every_verified_row(config):

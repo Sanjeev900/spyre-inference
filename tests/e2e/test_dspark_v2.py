@@ -31,10 +31,22 @@ PROMPTS = [
     + "IBM develops computers, software, and consulting services. " * 8
     + "\nName the company described above:",
     "What are the main businesses of IBM? Answer in one sentence.",
+    "Count by fives, separated by commas:\n5, 10, 15,",
+    "3, 6, 9, 12,",
+    "Read the following context. "
+    + "The Spyre accelerator runs large language models efficiently. " * 6
+    + "\nName the hardware described above:",
+    "Which company builds the Spyre accelerator? Answer in one sentence.",
 ]
 
-# The fill-in layout drafts 1 + K = block_size = 7 rows per request, so the compile
-# ladder and query buckets cover 7, 14 and 28 rows.
+
+def _number_list(count: int) -> str:
+    return ", ".join(str(i) for i in range(1, count + 1)) + ","
+
+
+# The fill-in layout drafts 1 + K = block_size = 7 rows per request, so each
+# ladder covers the draft blocks (7 rows x 1/2/4/8 requests, up to the cap)
+# plus the prefill chunk width.
 CASES = {
     "gemma4": dict(
         target="google/gemma-4-26B-A4B-it",
@@ -42,16 +54,42 @@ CASES = {
         draft="makora-ai/gemma4-26b-a4b-dspark",
         draft_revision="e6f739231e892fe4512c470136490d5441ffe62f",
         engine=dict(
-            max_model_len=2304,
-            max_num_seqs=4,
+            max_model_len=8192,
+            max_num_seqs=8,
             max_num_batched_tokens=128,
-            compilation_config={"compile_sizes": [1, 7, 14, 28]},
+            compilation_config={"compile_sizes": [1, 7, 14, 28, 56, 128]},
             gemma4_text_backbone=True,
         ),
-        env={"SPYRE_ATTN_QUERY_BUCKETS": "1,7,14,28", "SPYRE_ATTN_KV_BUCKETS": "128,256,2304"},
+        env={
+            "SPYRE_ATTN_QUERY_BUCKETS": "1,7,14,28,56,128",
+            "SPYRE_ATTN_KV_BUCKETS": "128,256,8192",
+        },
         batches={
-            # Different lengths, so the active draft batch shrinks through 4, 2 and 1.
-            "batch": (PROMPTS, [48, 40, 24, 32]),
+            # Different lengths, so the active draft batch shrinks through 8, 4, 2 and 1.
+            "batch": (PROMPTS, [48, 40, 24, 32, 36, 28, 20, 16]),
+        },
+    ),
+    "gemma4_tp4": dict(
+        target="google/gemma-4-26B-A4B-it",
+        target_revision="4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+        draft="makora-ai/gemma4-26b-a4b-dspark",
+        draft_revision="e6f739231e892fe4512c470136490d5441ffe62f",
+        engine=dict(
+            max_model_len=32768,
+            max_num_seqs=32,
+            max_num_batched_tokens=224,
+            compilation_config={"compile_sizes": [1, 7, 14, 28, 56, 112, 224]},
+            tensor_parallel_size=4,
+            gemma4_text_backbone=True,
+        ),
+        env={
+            "SPYRE_ATTN_QUERY_BUCKETS": "1,7,14,28,56,112,224",
+            "SPYRE_ATTN_KV_BUCKETS": "128,1024,4096,16384,32768",
+        },
+        batches={
+            "batch": (PROMPTS, [48, 40, 24, 32, 36, 28, 20, 16]),
+            # A prompt near the context cap, where drafting must stop cleanly.
+            "very_long": ([_number_list(6500)], [16]),
         },
     ),
 }
@@ -129,12 +167,24 @@ def _generate(case_name: str) -> dict:
 
 
 @pytest.mark.timeout(7200)
-@pytest.mark.parametrize("case_name", list(CASES))
+# Multi-card cases carry the 4-card mark so the dedicated spyre_pf_x4 CI job
+# collects them; the 1-card quality shards collect them and skip on device count.
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        pytest.param(name, marks=pytest.mark.distributed_tp4)
+        if "tensor_parallel_size" in CASES[name]["engine"]
+        else name
+        for name in CASES
+    ],
+)
 def test_dspark_on_v2_matches_the_target_alone(case_name):
-    from spyre_testing_plugin.pytest_plugin import spyre_hardware_present
+    from spyre_testing_plugin.pytest_plugin import spyre_device_count, spyre_hardware_present
 
     if not spyre_hardware_present():
         pytest.skip("Requires a Spyre accelerator")
+    if CASES[case_name]["engine"].get("tensor_parallel_size", 1) > spyre_device_count():
+        pytest.skip("Requires more Spyre accelerators than this host has")
     result = _generate(case_name)
     reference, speculative = result["reference"], result["spec"]
     for name in CASES[case_name]["batches"]:
