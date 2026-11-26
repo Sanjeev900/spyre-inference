@@ -273,10 +273,48 @@ def test_dspark_resolves_through_the_spyre_dflash_overrides():
         "DSparkSpeculator",
         "DFlashSpeculator",
     ]
-    for method in ("propose", "load_draft_model", "set_attn", "_generate_draft", "capture"):
+    for method in ("propose", "set_attn", "_generate_draft", "capture"):
         assert getattr(SpyreDSparkSpeculator, method) is getattr(SpyreDFlashSpeculator, method)
     assert issubclass(SpyreDSparkSpeculator, SpyreDFlashSpeculator)  # warmup's isinstance
     assert SpyreDSparkSpeculator.keep_on_host == ("model.markov_head.", "draft_id_to_target_id")
+
+
+def test_dspark_loads_with_a_host_side_sharing_comparison(monkeypatch):
+    """The only load_draft_model override: the target's embedding is already on
+    Spyre when upstream compares it with the draft's host copy, so the wrapper
+    routes the target weight through convert to the host for torch.equal."""
+    import torch.nn as nn
+
+    from spyre_inference.v1.worker.spyre import dspark as dspark_module
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    converted = []
+    monkeypatch.setattr(
+        dspark_module, "convert", lambda tensor, device=None: converted.append(device) or tensor
+    )
+    equal_args = []
+    monkeypatch.setattr(
+        dspark_module.torch, "equal", lambda a, b: equal_args.append((a, b)) or True
+    )
+
+    class Owner(nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = nn.Parameter(weight)
+
+    draft, target = Owner(torch.zeros(2, 2)), Owner(torch.ones(2, 2))
+    draft.has_own_embed_tokens = True
+
+    original = eagle_utils._should_share
+    with dspark_module._host_side_sharing_comparison():
+        assert eagle_utils._should_share is not original
+        assert eagle_utils._should_share(draft, "has_own_embed_tokens", draft, target)
+    assert eagle_utils._should_share is original
+    assert converted == ["cpu"]
+    assert equal_args == [(draft.weight, target.weight)]
+    # Without the flag, sharing is unconditional and nothing is compared.
+    draft.has_own_embed_tokens = False
+    assert eagle_utils._should_share(draft, "has_own_embed_tokens", draft, target)
 
 
 def test_a_dspark_step_warms_seven_row_blocks(speculator):
