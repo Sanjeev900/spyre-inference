@@ -135,6 +135,13 @@ forward and candidate scoring run on Spyre. The end-to-end test
 (`tests/e2e/test_dspark_v2.py`) and CI's public-model cache pin the same
 checkpoint revision as this example; update both together.
 
+Greedy token identity holds wherever the model's next-token choice is
+decisive. Near-tied choices can resolve differently between ordinary decoding
+and block verification — the FP16 limitation documented for XPress below — so
+the end-to-end test's prompts are chosen for a decisive winner at every
+position. Swap prompts only after checking that the winner's logprob lead
+over the runner-up stays large at every step.
+
 ## Refinement and compatibility
 
 The refiner follows [merged vLLM XPress](https://github.com/vllm-project/vllm/pull/54448):

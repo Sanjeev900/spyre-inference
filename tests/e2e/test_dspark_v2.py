@@ -24,6 +24,9 @@ import pytest
 
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
 
+# Greedy token-identity needs prompts whose next tokens are never near-tied;
+# near-tied ones flip between the verify and ordinary-decode paths (the docs'
+# known limitation). Keep only confident continuations here.
 PROMPTS = [
     "Continue counting by ones, separated by commas:\n1, 2, 3, 4, 5,",
     "2, 4, 6, 8,",
@@ -31,12 +34,12 @@ PROMPTS = [
     + "IBM develops computers, software, and consulting services. " * 8
     + "\nName the company described above:",
     "What are the main businesses of IBM? Answer in one sentence.",
-    "Count by fives, separated by commas:\n5, 10, 15,",
-    "3, 6, 9, 12,",
-    "Read the following context. "
-    + "The Spyre accelerator runs large language models efficiently. " * 6
-    + "\nName the hardware described above:",
     "Which company builds the Spyre accelerator? Answer in one sentence.",
+    "Read the following context. "
+    + "The Eiffel Tower is a famous landmark in Paris, France. " * 8
+    + "\nName the city described above:",
+    "Continue the alphabet, separated by commas:\nA, B, C, D,",
+    "What is the capital of France? Answer in one word.",
 ]
 
 
