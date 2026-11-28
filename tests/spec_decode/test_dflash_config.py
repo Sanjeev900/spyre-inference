@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from spyre_inference.v1.spec_decode.config import (
-    MAX_DFLASH_BATCH_SIZE,
+    MAX_DRAFT_BATCH_PER_RANK,
     normalize_speculative_config,
     validate_dflash_config,
 )
@@ -102,7 +102,7 @@ def config():
                 max_model_len=2048,
             ),
             num_speculative_tokens=15,
-            max_num_new_slots_for_drafting=15,
+            max_num_new_slots_for_drafting=0,
             draft_sample_method="greedy",
         ),
         model_config=NS(
@@ -119,10 +119,10 @@ def config():
     )
 
 
-@pytest.mark.parametrize("batch", [1, 2, 3, 4])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_published_contract_is_accepted(config, batch):
     config.scheduler_config.max_num_seqs = batch
-    config.scheduler_config.max_num_batched_tokens = 128
+    config.scheduler_config.max_num_batched_tokens = 16 * batch
     validate_dflash_config(config)
     assert config.speculative_config.draft_model_config.hf_config.xpress_topc == 128
 
@@ -259,6 +259,8 @@ def test_shifted_anchor_layout_is_rejected(config, nested):
         "missing_refiner",
         "prefix_cache",
         "batch",
+        "tp",
+        "sampling",
         "bf16",
         "draft_bf16",
         "quantized",
@@ -278,7 +280,11 @@ def test_incompatible_checkpoint_or_serving_configuration_fails_early(config, in
     elif invalid == "prefix_cache":
         config.cache_config.enable_prefix_caching = True
     elif invalid == "batch":
-        config.scheduler_config.max_num_seqs = MAX_DFLASH_BATCH_SIZE + 1
+        config.scheduler_config.max_num_seqs = MAX_DRAFT_BATCH_PER_RANK + 1
+    elif invalid == "tp":
+        config.parallel_config.tensor_parallel_size = 2
+    elif invalid == "sampling":
+        config.speculative_config.draft_sample_method = "probabilistic"
     elif invalid == "bf16":
         config.model_config.dtype = torch.bfloat16
     elif invalid == "draft_bf16":
@@ -292,7 +298,8 @@ def test_incompatible_checkpoint_or_serving_configuration_fails_early(config, in
 
 
 @pytest.mark.parametrize(
-    "batch,budget", [(1, 15), (1, 16), (1, 30), (2, 31), (2, 61), (3, 64), (4, 63), (4, 123)]
+    "batch,budget",
+    [(1, 15), (2, 16), (2, 31), (3, 47), (4, 63), (8, 127)],
 )
 def test_draft_batch_requires_enough_token_capacity(config, batch, budget):
     config.scheduler_config.max_num_seqs = batch
@@ -301,8 +308,8 @@ def test_draft_batch_requires_enough_token_capacity(config, batch, budget):
         validate_dflash_config(config)
 
 
-@pytest.mark.parametrize("batch,budget", [(1, 31), (2, 62), (3, 93), (4, 124)])
-def test_token_budget_includes_the_vllm_drafting_reservation(config, batch, budget):
+@pytest.mark.parametrize("batch,budget", [(1, 16), (2, 32), (3, 48), (4, 64), (8, 128)])
+def test_the_token_budget_covers_every_verified_row(config, batch, budget):
     config.scheduler_config.max_num_seqs = batch
     config.scheduler_config.max_num_batched_tokens = budget
     validate_dflash_config(config)

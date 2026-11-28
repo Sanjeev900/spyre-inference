@@ -798,10 +798,12 @@ class TorchSpyrePlatform(CpuPlatform):
         """MRV2 features the Spyre V2 runner does not implement, refused at startup rather
         than at their first, silently wrong, use."""
         parallel_config = vllm_config.parallel_config
+        from spyre_inference.v1.worker.spyre import speculators
+
         unsupported = {
-            "speculative decoding other than DFlash/XPress": (
+            "speculative decoding other than DFlash/XPress/DSpark": (
                 vllm_config.speculative_config is not None
-                and not vllm_config.speculative_config.use_dflash()
+                and not speculators.supports(vllm_config.speculative_config)
             ),
             # compute_logits_local bypasses the wrapper's H2D copy of the sampled rows.
             "batch-sharded sampling": bool(parallel_config.enable_batch_sharded_sampling),

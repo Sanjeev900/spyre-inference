@@ -479,3 +479,32 @@ def test_load_model_through_upstreams_body() -> None:
         "STOCK_COMPILES": "0",
         "MEMORY": "0",
     }, result.stdout[-3000:]
+
+
+def test_move_model_to_spyre_keeps_the_named_parameters_on_host(monkeypatch) -> None:
+    from spyre_inference.v1.worker import model_load
+
+    monkeypatch.setattr(model_load, "keep_attention_buffers_on_host", lambda: None)
+
+    class Head(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.markov_w1 = nn.Embedding(8, 4)
+
+    class Draft(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = Head()
+            self.fc = nn.Linear(4, 4)
+            self.draft_id_to_target_id = nn.Parameter(torch.zeros(8))
+
+    draft = Draft()
+    model_load.move_model_to_spyre(
+        draft,
+        torch.device("meta"),
+        keep_on_host=("model.markov_w1", "draft_id_to_target_id"),
+    )
+    assert draft.model.markov_w1.weight.device.type == "cpu"
+    assert draft.draft_id_to_target_id.device.type == "cpu"
+    assert draft.fc.weight.device.type == "meta"
+    assert draft.fc.bias is not None and draft.fc.bias.device.type == "meta"

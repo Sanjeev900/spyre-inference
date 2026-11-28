@@ -23,6 +23,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from spyre_inference.v1.worker.spyre import model_runner, spec_decode
+from spyre_inference.v1.worker.spyre.dspark import SpyreDSparkSpeculator
 from spyre_inference.v1.worker.spyre.spec_decode import SpyreDFlashSpeculator, _DraftBatchPadding
 
 BLOCK = 4  # one anchor and three drafts
@@ -44,7 +45,7 @@ class _DraftModel:
         self.forwards.append((input_ids.tolist(), positions.tolist()))
         return torch.zeros(input_ids.shape[0], 8)
 
-    def propose_block(self, hidden, anchor_ids):
+    def propose_block(self, hidden, anchor_ids, num_reqs=None, sampler=None):
         return [[a + 1 + k for k in range(BLOCK - 1)] for a in anchor_ids.tolist()]
 
 
@@ -75,6 +76,7 @@ def speculator(monkeypatch):
     s.spyre_device = torch.device("cpu")
     s.vllm_config = None
     s.model = _DraftModel()
+    s.draft_logits = None
     s.num_query_per_req = BLOCK
     s.max_num_reqs = 4
     s.parallel_drafting_token_id = MASK
@@ -237,13 +239,18 @@ def test_the_runner_replaces_upstreams_speculator(monkeypatch):
 
     monkeypatch.setattr(GPUModelRunner, "__init__", upstream_init)
     monkeypatch.setattr(model_runner, "validate_dflash_config", lambda config: None)
+    monkeypatch.setattr(model_runner, "validate_dspark_config", lambda config: None)
+    # select() resolves the class through the module attribute at call time.
     monkeypatch.setattr(
-        model_runner,
+        spec_decode,
         "SpyreDFlashSpeculator",
         lambda config, device, spyre_device: ("spyre", device, spyre_device),
     )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash", use_dflash=lambda: True)
+    )
     spyre = torch.device("meta")
-    runner = model_runner.SpyreModelRunnerV2(SimpleNamespace(), spyre)
+    runner = model_runner.SpyreModelRunnerV2(config, spyre)
     assert runner.speculator == ("spyre", torch.device("cpu"), spyre)
 
 
@@ -252,5 +259,148 @@ def test_the_runner_builds_no_speculator_without_one(monkeypatch):
         GPUModelRunner, "__init__", lambda self, c, d: setattr(self, "speculator", None)
     )
     monkeypatch.setattr(model_runner, "validate_dflash_config", lambda config: None)
+    monkeypatch.setattr(model_runner, "validate_dspark_config", lambda config: None)
     runner = model_runner.SpyreModelRunnerV2(SimpleNamespace(), torch.device("meta"))
     assert runner.speculator is None
+
+
+def test_dspark_resolves_through_the_spyre_dflash_overrides():
+    """MRO SpyreDSpark -> SpyreDFlash -> DSpark -> DFlash: our execution machinery
+    wins, upstream's dspark __init__/load run inside it."""
+    names = [c.__name__ for c in SpyreDSparkSpeculator.__mro__[:4]]
+    assert names == [
+        "SpyreDSparkSpeculator",
+        "SpyreDFlashSpeculator",
+        "DSparkSpeculator",
+        "DFlashSpeculator",
+    ]
+    for method in ("propose", "set_attn", "_generate_draft", "capture"):
+        assert getattr(SpyreDSparkSpeculator, method) is getattr(SpyreDFlashSpeculator, method)
+    assert issubclass(SpyreDSparkSpeculator, SpyreDFlashSpeculator)  # warmup's isinstance
+    assert SpyreDSparkSpeculator.keep_on_host == ("model.markov_head.", "draft_id_to_target_id")
+
+
+def test_dspark_loads_with_a_host_side_sharing_comparison(monkeypatch):
+    """The only load_draft_model override: the target's embedding is already on
+    Spyre when upstream compares it with the draft's host copy, so the wrapper
+    routes the target weight through convert to the host for torch.equal."""
+    import torch.nn as nn
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    from spyre_inference.v1.worker.spyre import dspark as dspark_module
+
+    converted = []
+    monkeypatch.setattr(
+        dspark_module, "convert", lambda tensor, device=None: converted.append(device) or tensor
+    )
+    equal_args = []
+    monkeypatch.setattr(
+        dspark_module.torch, "equal", lambda a, b: equal_args.append((a, b)) or True
+    )
+
+    class Owner(nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = nn.Parameter(weight)
+
+    draft, target = Owner(torch.zeros(2, 2)), Owner(torch.ones(2, 2))
+    draft.has_own_embed_tokens = True
+
+    original = eagle_utils._should_share
+    with dspark_module._host_side_sharing_comparison():
+        assert eagle_utils._should_share is not original
+        assert eagle_utils._should_share(draft, "has_own_embed_tokens", draft, target)
+    assert eagle_utils._should_share is original
+    assert converted == ["cpu"]
+    assert equal_args == [(draft.weight, target.weight)]
+    # Without the flag, sharing is unconditional and nothing is compared.
+    draft.has_own_embed_tokens = False
+    assert eagle_utils._should_share(draft, "has_own_embed_tokens", draft, target)
+
+
+def test_a_dspark_step_warms_seven_row_blocks(speculator):
+    """The fill-in layout drafts 1 + K = block_size rows per request."""
+    speculator.__class__ = SpyreDSparkSpeculator
+    speculator.num_query_per_req = 7
+    speculator.max_num_reqs = 8
+    speculator.draft_tokens = torch.full((8, 6), -7, dtype=torch.int64)
+    speculator.model.propose_block = lambda hidden, anchor_ids, num_reqs=None, sampler=None: [
+        [a + 1 + k for k in range(6)] for a in anchor_ids.tolist()
+    ]
+    speculator.warm_draft_batches()
+    widths = [len(ids) for ids, _ in speculator.model.forwards]
+    assert widths == [56, 28, 14, 7]
+    for ids, _ in speculator.model.forwards:
+        # The bonus token sits at offset 0 of each 7-row block; the rest is mask.
+        assert ids[::7] == [0] * (len(ids) // 7)
+        assert all(t == MASK for i, t in enumerate(ids) if i % 7)
+
+
+def test_the_probabilistic_sampler_scatters_and_draws_through_gumbel(speculator, monkeypatch):
+    """make_draft_sampler's closure: cast the step's draft-vocab logits, scatter
+    them into target space, then draw through the seeded gumbel sampler keyed on
+    the position before the sampled token."""
+    from spyre_inference.v1.worker.spyre import dspark as dspark_module
+
+    speculator.__class__ = SpyreDSparkSpeculator
+    reqs, steps, draft_vocab, vocab = 2, 3, 4, 6
+    speculator.draft_logits = torch.zeros(reqs * steps, vocab, dtype=torch.float16)
+    speculator._d2t_scatter_index = torch.tensor([0, 2, 4, 5])
+    speculator._draft_scatter_buf = torch.full(
+        (reqs * steps, vocab), float("-inf"), dtype=torch.float16
+    )
+    speculator.num_speculative_steps = steps
+    speculator.sample_idx_mapping = torch.arange(reqs * steps) * 10
+    speculator.sample_pos = torch.arange(1, reqs * steps + 1)
+    speculator.temperature = 0.7
+    speculator.seeds = object()
+    speculator.use_fp64_gumbel = True
+    speculator._step_cols = [1, 3, 5]
+
+    calls = []
+    monkeypatch.setattr(
+        dspark_module,
+        "gumbel_sample",
+        lambda *a, **k: calls.append((a, k)) or torch.tensor([9, 11]),
+    )
+    sampler = speculator.make_draft_sampler()
+    logits = torch.arange(reqs * draft_vocab, dtype=torch.float32).view(reqs, draft_vocab)
+    assert sampler(logits, 1, reqs).tolist() == [9, 11]
+
+    ((args, kwargs),) = calls
+    scattered, idx_map, temperature, seeds, pos = args
+    want = torch.full((reqs, vocab), float("-inf"), dtype=torch.float16)
+    want[:, speculator._d2t_scatter_index.tolist()] = logits.to(torch.float16)
+    assert torch.equal(scattered, want)
+    assert idx_map.tolist() == [10, 40] and pos.tolist() == [1, 4]
+    assert (temperature, seeds) == (0.7, speculator.seeds)
+    assert kwargs == dict(
+        apply_temperature=True,
+        is_drafting=True,
+        logits_cache=speculator.draft_logits,
+        logits_cache_col=3,
+        use_fp64=True,
+    )
+
+
+def test_the_sampler_passes_full_vocab_logits_through_without_a_scatter(speculator, monkeypatch):
+    from spyre_inference.v1.worker.spyre import dspark as dspark_module
+
+    speculator.__class__ = SpyreDSparkSpeculator
+    speculator.draft_logits = torch.zeros(2, 6, dtype=torch.float16)
+    speculator._d2t_scatter_index = None
+    speculator.num_speculative_steps = 3
+    speculator.sample_idx_mapping = torch.arange(6)
+    speculator.sample_pos = torch.arange(1, 7)
+    speculator.temperature = 0.0
+    speculator.seeds = None
+    speculator.use_fp64_gumbel = False
+    speculator._step_cols = [0, 1, 2]
+
+    seen = []
+    monkeypatch.setattr(dspark_module, "gumbel_sample", lambda *a, **k: seen.append((a, k)) or a[0])
+    logits = torch.randn(2, 6)
+    sampler = speculator.make_draft_sampler()
+    assert torch.equal(sampler(logits, 2, 2), logits.to(torch.float16))
+    ((args, _),) = seen
+    assert torch.equal(args[0], logits.to(torch.float16))

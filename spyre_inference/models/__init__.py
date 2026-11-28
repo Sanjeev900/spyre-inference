@@ -43,6 +43,7 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "DFlashDraftModel": "spyre_inference.models.qwen3_dflash:SpyreDFlashQwen3ForCausalLM",
     "Qwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
     "DFlashQwen3XPressModel": "spyre_inference.models.qwen3_dflash:SpyreQwen3XPressForCausalLM",
+    "Qwen3DSparkModel": "spyre_inference.models.qwen3_dspark:SpyreQwen3DSparkForCausalLM",
     "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
     # Vision tower only: upstream builds its language model through the registry, as
     # Gemma4ForCausalLM below.

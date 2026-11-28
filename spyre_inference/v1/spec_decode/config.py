@@ -14,7 +14,7 @@
 
 import torch
 
-MAX_DFLASH_BATCH_SIZE = 4
+MAX_DRAFT_BATCH_PER_RANK = 8
 
 
 def normalize_speculative_config(engine_args) -> None:
@@ -27,11 +27,56 @@ def normalize_speculative_config(engine_args) -> None:
         # Match vLLM's name-based detection before it applies cache defaults.
         if "dflash" in model and "eagle-" not in model and "eagle3" not in model:
             method = "dflash"
-    if method != "dflash":
+        elif "dspark" in model:
+            method = "dspark"
+    if method not in ("dflash", "dspark"):
         return
-    engine_args.speculative_config = spec | {"method": "dflash"}
+    engine_args.speculative_config = spec | {"method": method}
     if engine_args.enable_prefix_caching is None:
         engine_args.enable_prefix_caching = False
+
+
+def _validate_serving_constraints(config, spec, name: str) -> None:
+    """What every Spyre draft family requires; `name` scopes the error messages."""
+    if spec.max_model_len is None and spec.draft_shares_target_positions():
+        # The platform's default length cap must not stop drafts inside the target context.
+        spec.draft_model_config.max_model_len = config.model_config.max_model_len
+    parallel = config.parallel_config
+    if config.model_config.dtype != torch.float16 or spec.draft_model_config.dtype != torch.float16:
+        raise ValueError(f"{name} currently requires float16 serving weights")
+    if config.model_config.enforce_eager:
+        raise ValueError(f"{name} currently requires compiled execution")
+    if (
+        config.model_config.quantization is not None
+        or spec.draft_model_config.quantization is not None
+    ):
+        raise ValueError(f"{name} currently requires unquantized target and draft weights")
+    # TP replicates the request batch on every rank; the cap grows with TP
+    # because 8 requests at TP1 and 32 at TP4 are the shapes validated on Spyre.
+    max_seqs = MAX_DRAFT_BATCH_PER_RANK * parallel.tensor_parallel_size
+    if parallel.pipeline_parallel_size != 1 or (
+        not 1 <= config.scheduler_config.max_num_seqs <= max_seqs
+    ):
+        raise ValueError(f"{name} currently requires PP=1 and max_num_seqs<={max_seqs}")
+    if config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            f"Disable prefix caching for {name}: draft context needs every target state"
+        )
+    target = config.model_config.hf_text_config
+    if target.model_type not in {"qwen3", "gemma4", "gemma4_text"} or (
+        config.model_config.is_multimodal_model
+    ):
+        raise ValueError(f"{name} supports Qwen3 and Gemma 4 text targets")
+    block = spec.num_speculative_tokens + 1
+    minimum_budget = config.scheduler_config.max_num_seqs * (
+        block + spec.max_num_new_slots_for_drafting
+    )
+    if config.scheduler_config.max_num_batched_tokens < minimum_budget:
+        raise ValueError(
+            "max_num_batched_tokens must cover target verification "
+            "and vLLM's per-request drafting reservation "
+            f"(at least {minimum_budget} tokens)"
+        )
 
 
 def validate_dflash_config(config) -> None:
@@ -46,50 +91,12 @@ def validate_dflash_config(config) -> None:
             f"Unsupported Spyre DFlash/XPress draft architecture: {architecture}. "
             f"Supported architectures: {', '.join(sorted(supported_drafts))}"
         )
-    target = config.model_config.hf_text_config
-    if spec.max_model_len is None and spec.draft_shares_target_positions():
-        # The platform's default length cap must not stop drafts inside the target context.
-        spec.draft_model_config.max_model_len = config.model_config.max_model_len
-    parallel = config.parallel_config
-    if config.model_config.dtype != torch.float16 or spec.draft_model_config.dtype != torch.float16:
-        raise ValueError("Spyre DFlash/XPress currently requires float16 serving weights")
-    if config.model_config.enforce_eager:
-        raise ValueError("Spyre DFlash/XPress currently requires compiled execution")
-    if (
-        config.model_config.quantization is not None
-        or spec.draft_model_config.quantization is not None
-    ):
-        raise ValueError(
-            "Spyre DFlash/XPress currently requires unquantized target and draft weights"
-        )
-    if (
-        parallel.tensor_parallel_size != 1
-        or parallel.pipeline_parallel_size != 1
-        or not 1 <= config.scheduler_config.max_num_seqs <= MAX_DFLASH_BATCH_SIZE
-    ):
-        raise ValueError(
-            "Spyre DFlash/XPress currently requires TP=1, PP=1 and "
-            f"max_num_seqs<={MAX_DFLASH_BATCH_SIZE}"
-        )
-    if config.cache_config.enable_prefix_caching:
-        raise ValueError(
-            "Disable prefix caching for Spyre DFlash/XPress: draft context needs every target state"
-        )
-    if target.model_type not in {"qwen3", "gemma4", "gemma4_text"} or (
-        config.model_config.is_multimodal_model
-    ):
-        raise ValueError("Spyre DFlash/XPress supports Qwen3 and Gemma 4 text targets")
+    if config.parallel_config.tensor_parallel_size != 1:
+        raise ValueError("Spyre DFlash/XPress currently requires TP=1")
+    _validate_serving_constraints(config, spec, "Spyre DFlash/XPress")
     if spec.draft_sample_method != "greedy":
         raise ValueError("Spyre DFlash/XPress currently uses greedy proposals")
-    max_batch = config.scheduler_config.max_num_seqs
-    block = spec.num_speculative_tokens + 1
-    minimum_budget = max_batch * (block + spec.max_num_new_slots_for_drafting)
-    if config.scheduler_config.max_num_batched_tokens < minimum_budget:
-        raise ValueError(
-            "max_num_batched_tokens must cover target verification "
-            "and vLLM's per-request drafting reservation "
-            f"(at least {minimum_budget} tokens)"
-        )
+    target = config.model_config.hf_text_config
     if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
         raise ValueError("The draft must share the target hidden size and full vocabulary")
     if getattr(draft, "draft_vocab_size", draft.vocab_size) not in (None, target.vocab_size):
@@ -140,3 +147,56 @@ def validate_dflash_config(config) -> None:
         "sample_from_anchor", False
     ):
         raise ValueError("Spyre XPress requires a fixed anchor in slot zero")
+
+
+def validate_dspark_config(config) -> None:
+    spec = config.speculative_config
+    if spec is None or not spec.use_dspark():
+        return
+    draft = spec.draft_model_config.hf_config
+    if spec.draft_model_config.architecture != "Qwen3DSparkModel":
+        raise ValueError(
+            f"Unsupported Spyre DSpark draft architecture: "
+            f"{spec.draft_model_config.architecture}. Supported: Qwen3DSparkModel"
+        )
+    _validate_serving_constraints(config, spec, "Spyre DSpark")
+    target = config.model_config.hf_text_config
+    if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
+        raise ValueError("The draft must share the target hidden size and full input vocabulary")
+    draft_vocab = getattr(draft, "draft_vocab_size", None) or draft.vocab_size
+    if not 0 < draft_vocab <= target.vocab_size:
+        raise ValueError("draft_vocab_size must be at most the target vocabulary")
+    if getattr(draft, "logit_scale", 1.0) != 1.0 or getattr(draft, "attention_bias", False):
+        raise ValueError("Spyre DSpark requires unscaled logits and no attention bias")
+    # Only speculators-format adapters write an explicit False; the speculator-level
+    # default is the anchor layout, which Spyre does not serve.
+    if getattr(draft, "sample_from_anchor", True) is not False:
+        raise ValueError(
+            "Spyre DSpark currently requires the fill-in layout (sample_from_anchor=false)"
+        )
+    block_size = getattr(draft, "block_size", None)
+    if block_size != spec.num_speculative_tokens + 1:
+        raise ValueError(
+            "num_speculative_tokens must equal the checkpoint block size minus one; "
+            "vLLM defaults it to block_size, so pass "
+            f"num_speculative_tokens={(block_size or 0) - 1} explicitly"
+        )
+    aux_layers = getattr(draft, "eagle_aux_hidden_state_layer_ids", None)
+    if (
+        not aux_layers
+        or aux_layers != sorted(set(aux_layers))
+        or not all(1 <= i < target.num_hidden_layers for i in aux_layers)
+    ):
+        raise ValueError(
+            "The draft checkpoint must identify ordered, distinct aux hidden-state "
+            "layers inside the target (layer 0 has no predecessor to project from)"
+        )
+    rank = getattr(draft, "markov_rank", None)
+    if type(rank) is not int or rank <= 0:
+        raise ValueError("Spyre DSpark requires a positive integer markov_rank")
+    if getattr(spec, "dspark_draft_topk", None) or getattr(draft, "dspark_draft_topk", None):
+        raise ValueError("Spyre DSpark does not support dspark_draft_topk")
+    if getattr(spec, "enable_adaptive_verification", False):
+        raise ValueError("Spyre DSpark does not support adaptive verification")
+    # The confidence head only feeds adaptive verification; skip its fp32 weights.
+    draft.enable_confidence_head = False

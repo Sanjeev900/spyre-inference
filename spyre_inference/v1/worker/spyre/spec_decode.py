@@ -61,6 +61,10 @@ class _DraftBatchPadding:
 class SpyreDFlashSpeculator(DFlashSpeculator):
     model: "SpyreDFlashQwen3ForCausalLM"
 
+    # Parameters move_model_to_spyre leaves on the host, as segment paths of the
+    # dotted parameter names.
+    keep_on_host: tuple[str, ...] = ()
+
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, spyre_device: torch.device
     ) -> None:
@@ -73,7 +77,7 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
             "SpyreDFlashQwen3ForCausalLM",
             super().load_draft_model(target_model, target_attn_layer_names),
         )
-        move_model_to_spyre(model, self.spyre_device)
+        move_model_to_spyre(model, self.spyre_device, keep_on_host=self.keep_on_host)
         model.prepare_for_spyre()
         return model
 
@@ -187,8 +191,12 @@ class SpyreDFlashSpeculator(DFlashSpeculator):
         hidden = self._run_model(num_tokens_padded, *args, **kwargs)
         block = self.num_query_per_req
         anchors = self.input_buffers.input_ids[:num_tokens_padded:block].to(torch.int64)
-        proposals = self.model.propose_block(hidden, anchors)
+        proposals = self.model.propose_block(hidden, anchors, num_reqs, self.make_draft_sampler())
         self.draft_tokens[:num_reqs] = torch.tensor(proposals[:num_reqs])
+
+    def make_draft_sampler(self):
+        """Greedy drafting samples nothing; probabilistic subclasses override."""
+        return None
 
     def warm_draft_batches(self) -> None:
         """The draft forward and proposal at every padded batch _DraftBatchPadding serves.
